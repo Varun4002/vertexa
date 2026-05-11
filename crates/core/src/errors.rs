@@ -40,6 +40,12 @@ pub enum VertexaError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("trade not profitable: ratio {reward_to_cost:.2} below minimum {minimum:.2}")]
+    TradeNotProfitable {
+        reward_to_cost: f64,
+        minimum: f64,
+    },
 }
 
 impl From<config::ConfigError> for VertexaError {

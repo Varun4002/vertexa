@@ -11,7 +11,7 @@ use alloy::providers::ProviderBuilder;
 
 use vertexa_core::{
     Decision, MarketContext, MevThreatAssessment, PlannedTrade, PriceSeries,
-    Signal, Vote, ExecutionRoute, PendingTx, UNISWAP_V3_ROUTER,
+    Signal, Vote, ExecutionRoute, PendingTx, UNISWAP_V3_ROUTER, FixedUsd, VertexaError,
 };
 use vertexa_ingestion::{price_feed, pool_reader, context_builder::ContextBuilder};
 use vertexa_signals::{RsiSignal, EmaCrossoverSignal, OrderBookSignal, OnchainFlowSignal};
@@ -205,7 +205,14 @@ async fn main() -> eyre::Result<()> {
             continue;
         }
 
-        let trade = build_planned_trade(&decision, &ctx, &app_cfg);
+        let adjusted_usd = app_cfg.trading.max_trade_usd * decision.size_multiplier;
+
+        if adjusted_usd < 10.0 {
+            warn!(target: "vertexa", "Adjusted trade size too small, skipping");
+            continue;
+        }
+
+        let trade = build_planned_trade(&decision, &ctx, &app_cfg, adjusted_usd);
 
         let assessment = mev_guard.assess(&trade, ctx.pool_liquidity).await;
 
@@ -215,6 +222,19 @@ async fn main() -> eyre::Result<()> {
                 risk_score = assessment.risk_score,
                 reason = "MEV guard aborted",
                 "TRADE ABORTED"
+            );
+            continue;
+        }
+
+        if let Err(e) = risk_checker.check_profitability(
+            &trade,
+            decision.avg_confidence,
+            FixedUsd::from_dollars(assessment.estimated_mev_loss_usd),
+        ) {
+            warn!(
+                target: "vertexa",
+                error = %e,
+                "profitability check failed — skipping trade"
             );
             continue;
         }
@@ -269,8 +289,9 @@ fn build_planned_trade(
     decision: &Decision,
     ctx: &MarketContext,
     cfg: &AppConfig,
+    adjusted_usd: f64,
 ) -> PlannedTrade {
-    let amount_usd = cfg.trading.max_trade_usd.min(1000.0);
+    let amount_usd = adjusted_usd.min(1000.0);
     let amount_in_wei = (amount_usd * 1e18 / ctx.current_price) as u128;
 
     let max_slippage = if decision.avg_confidence > 0.7 {

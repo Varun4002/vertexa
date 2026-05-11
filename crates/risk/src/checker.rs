@@ -4,7 +4,8 @@ use chrono::{Utc, DateTime};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
-use vertexa_core::{PlannedTrade, MevThreatAssessment, ExecutionRoute};
+use vertexa_core::{PlannedTrade, MevThreatAssessment, ExecutionRoute, VertexaError, FixedUsd};
+use crate::profitability::{ProfitabilityCheck, CostBreakdown};
 
 pub struct RiskChecker {
     max_trade_usd: f64,
@@ -14,6 +15,7 @@ pub struct RiskChecker {
     daily_loss: AtomicU64,
     circuit_breaker_active: AtomicU64,
     last_reset: Arc<std::sync::Mutex<DateTime<Utc>>>,
+    pub profitability: ProfitabilityCheck,
 }
 
 impl RiskChecker {
@@ -26,7 +28,43 @@ impl RiskChecker {
             daily_loss: AtomicU64::new(0),
             circuit_breaker_active: AtomicU64::new(0),
             last_reset: Arc::new(std::sync::Mutex::new(Utc::now())),
+            profitability: ProfitabilityCheck::new(),
         }
+    }
+
+    pub fn check_profitability(
+        &self,
+        trade: &PlannedTrade,
+        avg_confidence: f64,
+        estimated_mev_loss: FixedUsd,
+    ) -> Result<CostBreakdown, VertexaError> {
+        let breakdown = self.profitability.evaluate(
+            trade,
+            avg_confidence,
+            estimated_mev_loss,
+            FixedUsd::from_dollars(0.10),
+        );
+
+        info!(
+            target: "vertexa",
+            gas        = %breakdown.gas_cost_usd,
+            slippage   = %breakdown.slippage_cost_usd,
+            mev        = %breakdown.mev_cost_usd,
+            total_cost = %breakdown.total_cost_usd,
+            edge       = %breakdown.expected_edge_usd,
+            net        = %breakdown.net_expected_usd,
+            ratio      = breakdown.reward_to_cost,
+            profitable = breakdown.is_profitable,
+            "profitability check"
+        );
+
+        if !breakdown.is_profitable {
+            return Err(VertexaError::TradeNotProfitable {
+                reward_to_cost: breakdown.reward_to_cost,
+                minimum: self.profitability.min_reward_to_cost,
+            });
+        }
+        Ok(breakdown)
     }
 
     pub fn check(

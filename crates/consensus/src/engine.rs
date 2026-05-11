@@ -2,11 +2,13 @@ use futures::future::join_all;
 use tracing::info;
 
 use vertexa_core::{Decision, MarketContext, Signal, Vote, SignalResult};
+use vertexa_signals::{VolatilityRegimeSignal, Regime};
 
 pub struct ConsensusEngine {
     signals: Vec<Box<dyn Signal>>,
     required_votes: usize,
     min_confidence: f64,
+    pub regime_signal: VolatilityRegimeSignal,
 }
 
 impl ConsensusEngine {
@@ -19,10 +21,38 @@ impl ConsensusEngine {
             signals,
             required_votes,
             min_confidence,
+            regime_signal: VolatilityRegimeSignal::new(),
         }
     }
 
     pub async fn evaluate(&self, ctx: &MarketContext) -> Decision {
+        let regime = match VolatilityRegimeSignal::classify(&ctx.prices, 14) {
+            Some(r) => r,
+            None => Regime::Ranging,
+        };
+
+        if regime == Regime::Ranging {
+            info!(
+                target: "vertexa",
+                regime = "ranging",
+                "Pre-gate blocked — market ranging"
+            );
+            return Decision {
+                action: Vote::Neutral,
+                agreeing_signals: vec![],
+                avg_confidence: 0.0,
+                dissenting_signals: vec![],
+                blocked_by: Some("VolatilityRegime::Ranging"),
+                size_multiplier: 0.0,
+            };
+        }
+
+        let size_multiplier = match regime {
+            Regime::Trending => 1.0,
+            Regime::Volatile => 0.5,
+            Regime::Ranging => unreachable!(),
+        };
+
         let futures = self.signals.iter().map(|s| s.evaluate(ctx));
         let results = join_all(futures).await;
 
@@ -85,6 +115,8 @@ impl ConsensusEngine {
             avg_confidence,
             agreeing_signals: agreeing_signals.clone(),
             dissenting_signals: dissenting_signals.clone(),
+            size_multiplier,
+            blocked_by: None,
         };
 
         if action.is_directional() && avg_confidence < self.min_confidence {
@@ -100,6 +132,8 @@ impl ConsensusEngine {
                 agreeing_signals: vec![],
                 avg_confidence: 0.0,
                 dissenting_signals: agreeing_signals,
+                size_multiplier: 0.0,
+                blocked_by: Some("ConfidenceGate"),
             };
         }
 
@@ -137,15 +171,17 @@ mod tests {
     }
 
     fn make_ctx() -> MarketContext {
+        let prices: Vec<f64> = (0..30).map(|i| 3000.0 + i as f64 * 35.0).collect();
+        let current_price = prices.last().copied().unwrap_or(3000.0);
         MarketContext {
             pair: "ETH/USDC".into(),
             pool_address: Default::default(),
-            prices: vec![3000.0; 30],
+            prices,
             volumes: vec![],
             orderbook: OrderBook { bids: vec![], asks: vec![] },
             recent_whale_txs: vec![],
             pool_liquidity: 10_000_000.0,
-            current_price: 3000.0,
+            current_price,
             block_number: 0,
             timestamp: Instant::now(),
         }

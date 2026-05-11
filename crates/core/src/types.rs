@@ -1,6 +1,40 @@
 use alloy::primitives::{Address, B256, U256, address};
 use crate::Vote;
 use std::time::Instant;
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct FixedUsd(pub f64);
+
+impl FixedUsd {
+    pub fn from_dollars(amount: f64) -> Self {
+        Self(amount)
+    }
+
+    pub fn to_dollars(&self) -> f64 {
+        self.0
+    }
+}
+
+impl fmt::Display for FixedUsd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "${:.2}", self.0)
+    }
+}
+
+impl std::ops::Add for FixedUsd {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for FixedUsd {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MarketContext {
@@ -86,6 +120,8 @@ pub struct Decision {
     pub agreeing_signals: Vec<String>,
     pub avg_confidence: f64,
     pub dissenting_signals: Vec<String>,
+    pub size_multiplier: f64,
+    pub blocked_by: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]

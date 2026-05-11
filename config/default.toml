@@ -1,0 +1,31 @@
+[network]
+rpc_http = "https://arb1.arbitrum.io/rpc"
+rpc_ws = "wss://arb1.arbitrum.io/ws"
+chain_id = 42161
+
+[trading]
+pair = "ETH/USDC"
+pool_address = "0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443"
+pool_fee_tier = 500
+max_trade_usd = 10000.0
+max_position_usd = 50000.0
+loop_interval_s = 15
+
+[risk]
+daily_loss_limit_usd = 500.0
+max_slippage_public = 0.005
+max_slippage_flashbots = 0.002
+max_slippage_split = 0.001
+min_chunk_usd = 500.0
+
+[mev]
+flashbots_relay_url = "https://relay.arbitrum.io"
+known_bot_addresses = [
+    "0x00000000003b3cc22aF3aE1EAc0440BcEe416B40",
+    "0x000000000035B5e5ad9019092C665357240f594e",
+]
+mempool_buffer_size = 500
+
+[consensus]
+required_votes = 3
+min_confidence = 0.35

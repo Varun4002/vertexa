@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/ingestion",
+    "crates/signals",
+    "crates/consensus",
+    "crates/mev_guard",
+    "crates/risk",
+    "crates/executor",
+    "bin",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+alloy = { version = "2", features = ["full"] }
+alloy-provider = { version = "2", features = ["full"] }
+alloy-signer = { version = "2" }
+alloy-signer-local = { version = "2" }
+alloy-consensus = { version = "2" }
+alloy-rpc-types = { version = "2", features = ["eth"] }
+alloy-primitives = { version = "2" }
+alloy-sol-types = { version = "2" }
+alloy-transport = { version = "2" }
+alloy-pubsub = { version = "2" }
+alloy-network = { version = "2" }
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+config = "0.14"
+eyre = "0.6"
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json"] }
+hex = "0.4"
+thiserror = "1"
+dotenvy = "0.15"
+chrono = "0.4"
+url = "2"

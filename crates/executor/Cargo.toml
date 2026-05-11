@@ -1,0 +1,11 @@
+[package]
+name = "vertexa-executor"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vertexa-core = { path = "../core" }
+alloy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hex.workspace = true

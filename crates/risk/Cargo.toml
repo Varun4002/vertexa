@@ -1,0 +1,10 @@
+[package]
+name = "vertexa-risk"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vertexa-core = { path = "../core" }
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true

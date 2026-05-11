@@ -1,0 +1,17 @@
+[package]
+name = "vertexa-ingestion"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vertexa-core = { path = "../core" }
+alloy.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-tungstenite.workspace = true
+reqwest.workspace = true
+eyre.workspace = true
+hex.workspace = true

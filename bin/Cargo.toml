@@ -1,0 +1,27 @@
+[package]
+name = "vertexa-bin"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "vertexa"
+path = "vertexa.rs"
+
+[dependencies]
+vertexa-core = { path = "../crates/core" }
+vertexa-ingestion = { path = "../crates/ingestion" }
+vertexa-signals = { path = "../crates/signals" }
+vertexa-consensus = { path = "../crates/consensus" }
+vertexa-mev-guard = { path = "../crates/mev_guard" }
+vertexa-risk = { path = "../crates/risk" }
+vertexa-executor = { path = "../crates/executor" }
+alloy.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+config.workspace = true
+eyre.workspace = true
+dotenvy.workspace = true
+chrono.workspace = true

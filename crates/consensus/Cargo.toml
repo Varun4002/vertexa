@@ -1,0 +1,11 @@
+[package]
+name = "vertexa-consensus"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vertexa-core = { path = "../core" }
+vertexa-signals = { path = "../signals" }
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true

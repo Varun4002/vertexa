@@ -1,0 +1,9 @@
+[package]
+name = "vertexa-signals"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vertexa-core = { path = "../core" }
+async-trait.workspace = true
+tracing.workspace = true

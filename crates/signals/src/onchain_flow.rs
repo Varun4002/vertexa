@@ -9,6 +9,12 @@ impl OnchainFlowSignal {
     }
 }
 
+impl Default for OnchainFlowSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Signal for OnchainFlowSignal {
     fn name(&self) -> &'static str {

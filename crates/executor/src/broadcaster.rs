@@ -1,21 +1,29 @@
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::network::TransactionBuilder;
 use alloy::rpc::types::TransactionRequest;
-use alloy::primitives::Bytes;
 use std::time::Duration;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 use vertexa_core::{ExecutionRoute, PlannedTrade, MevThreatAssessment};
+use vertexa_mev_guard::{FlashbotsRelay, SplitExecutor};
 use crate::signer::TxSigner;
 
 pub struct Broadcaster {
     rpc_url: String,
+    flashbots_relay: FlashbotsRelay,
+    split_executor: SplitExecutor,
 }
 
 impl Broadcaster {
-    pub fn new(rpc_url: &str) -> Self {
+    pub fn new(
+        rpc_url: &str,
+        flashbots_relay: FlashbotsRelay,
+        split_executor: SplitExecutor,
+    ) -> Self {
         Self {
             rpc_url: rpc_url.to_string(),
+            flashbots_relay,
+            split_executor,
         }
     }
 
@@ -42,13 +50,13 @@ impl Broadcaster {
 
         match route {
             ExecutionRoute::PublicMempool => {
-                self.broadcast_public(tx, signer).await
+                self.broadcast_public(tx).await
             }
             ExecutionRoute::FlashbotsBundle => {
-                self.broadcast_public(tx, signer).await
+                self.broadcast_flashbots(tx, signer).await
             }
             ExecutionRoute::SplitExecution => {
-                self.broadcast_public(tx, signer).await
+                self.broadcast_split(tx, signer, trade, assessment).await
             }
             ExecutionRoute::Abort => {
                 Err("trade aborted by MEV guard".into())
@@ -59,7 +67,6 @@ impl Broadcaster {
     async fn broadcast_public(
         &self,
         tx: &TransactionRequest,
-        signer: &TxSigner,
     ) -> Result<String, String> {
         let provider = ProviderBuilder::new()
             .connect(&self.rpc_url)
@@ -113,5 +120,67 @@ impl Broadcaster {
                 Ok(format!("{:?}", tx_hash))
             }
         }
+    }
+
+    async fn broadcast_flashbots(
+        &self,
+        tx: &TransactionRequest,
+        signer: &TxSigner,
+    ) -> Result<String, String> {
+        let provider = ProviderBuilder::new()
+            .connect(&self.rpc_url)
+            .await
+            .map_err(|e| format!("failed to connect for signing: {e}"))?;
+
+        let block_number = provider.get_block_number().await
+            .map_err(|e| format!("failed to get block number: {e}"))?;
+
+        let signed_tx = signer.sign_tx(tx, &provider).await?;
+
+        info!(
+            target: "vertexa",
+            target_block = block_number + 1,
+            "submitting flashbots bundle"
+        );
+
+        self.flashbots_relay.submit_bundle_raw(
+            &[signed_tx],
+            block_number + 1,
+        ).await
+    }
+
+    async fn broadcast_split(
+        &self,
+        tx: &TransactionRequest,
+        signer: &TxSigner,
+        trade: &PlannedTrade,
+        assessment: &MevThreatAssessment,
+    ) -> Result<String, String> {
+        let provider = ProviderBuilder::new()
+            .connect(&self.rpc_url)
+            .await
+            .map_err(|e| format!("failed to connect for split: {e}"))?;
+
+        let block_number = provider.get_block_number().await
+            .map_err(|e| format!("failed to get block number: {e}"))?;
+
+        let signed_tx = signer.sign_tx(tx, &provider).await?;
+        let chunks = self.split_executor.compute_chunks(trade, assessment.risk_score);
+
+        for chunk in &chunks {
+            let target_block = block_number + chunk.delay_blocks + 1;
+            info!(
+                target: "vertexa",
+                chunk_target = target_block,
+                chunk_amount = %chunk.amount_in,
+                "submitting split chunk via flashbots"
+            );
+            self.flashbots_relay.submit_bundle_raw(
+                std::slice::from_ref(&signed_tx),
+                target_block,
+            ).await?;
+        }
+
+        Ok(format!("split-{}chunks", chunks.len()))
     }
 }

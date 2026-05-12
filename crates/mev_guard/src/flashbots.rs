@@ -1,7 +1,6 @@
-use alloy::primitives::Bytes;
 use serde_json::json;
-use tracing::{info, warn, error};
-use vertexa_core::{PlannedTrade, ExecutionRoute};
+use tracing::{info, warn};
+use vertexa_core::PlannedTrade;
 
 pub struct FlashbotsRelay {
     relay_url: String,

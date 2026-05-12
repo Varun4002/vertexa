@@ -7,3 +7,7 @@ version.workspace = true
 vertexa-core = { path = "../core" }
 async-trait.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+alloy.workspace = true
+tokio.workspace = true

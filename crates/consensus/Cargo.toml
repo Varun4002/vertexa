@@ -9,3 +9,6 @@ vertexa-signals = { path = "../signals" }
 async-trait.workspace = true
 futures.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

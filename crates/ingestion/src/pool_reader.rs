@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::primitives::{address, U256};
+use alloy::primitives::U256;
 use alloy::sol;
 use tracing::{info, warn, error};
 use std::time::Duration;
@@ -45,6 +45,7 @@ fn sqrt_price_to_usd(sqrt_price_x96: U256) -> f64 {
 pub async fn start(
     current_price: Arc<RwLock<f64>>,
     pool_liquidity: Arc<RwLock<f64>>,
+    block_number: Arc<RwLock<u64>>,
     rpc_url: &str,
 ) {
     let pool_addr = match POOL_ADDR.parse::<alloy::primitives::Address>() {
@@ -101,6 +102,11 @@ pub async fn start(
                 Err(e) => {
                     warn!(target: "vertexa", error = %e, "failed to read liquidity");
                 }
+            }
+
+            if let Ok(bn) = provider.get_block_number().await {
+                let mut bn_val = block_number.write().await;
+                *bn_val = bn;
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;

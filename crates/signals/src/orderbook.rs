@@ -9,6 +9,12 @@ impl OrderBookSignal {
     }
 }
 
+impl Default for OrderBookSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Signal for OrderBookSignal {
     fn name(&self) -> &'static str {

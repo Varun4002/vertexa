@@ -4865,6 +4865,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "tokio",
  "tracing",
  "vertexa-core",
  "vertexa-signals",
@@ -4891,10 +4892,14 @@ name = "vertexa-executor"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "futures",
  "hex",
+ "reqwest 0.12.28",
+ "serde_json",
  "tokio",
  "tracing",
  "vertexa-core",
+ "vertexa-mev-guard",
 ]
 
 [[package]]
@@ -4933,6 +4938,7 @@ dependencies = [
 name = "vertexa-risk"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "chrono",
  "tokio",
  "tracing",
@@ -4943,7 +4949,9 @@ dependencies = [
 name = "vertexa-signals"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "async-trait",
+ "tokio",
  "tracing",
  "vertexa-core",
 ]

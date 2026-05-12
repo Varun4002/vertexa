@@ -8,3 +8,6 @@ vertexa-core = { path = "../core" }
 tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+alloy.workspace = true

@@ -7,6 +7,15 @@ impl EmaCrossoverSignal {
     pub fn new() -> Self {
         Self
     }
+}
+
+impl Default for EmaCrossoverSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmaCrossoverSignal {
 
     fn calculate_ema(prices: &[f64], period: usize) -> Vec<f64> {
         if prices.len() < period {
@@ -17,8 +26,8 @@ impl EmaCrossoverSignal {
         let mut ema = vec![0.0_f64; prices.len()];
         let mut sum = 0.0;
 
-        for i in 0..period {
-            sum += prices[i];
+        for p in prices.iter().take(period) {
+            sum += p;
         }
         ema[period - 1] = sum / period as f64;
 
@@ -75,6 +84,7 @@ mod tests {
     use vertexa_core::{MarketContext, OrderBook};
 
     fn make_context(prices: Vec<f64>) -> MarketContext {
+        let current_price = *prices.last().unwrap_or(&0.0);
         MarketContext {
             pair: "ETH/USDC".into(),
             pool_address: Default::default(),
@@ -83,7 +93,7 @@ mod tests {
             orderbook: OrderBook { bids: vec![], asks: vec![] },
             recent_whale_txs: vec![],
             pool_liquidity: 10_000_000.0,
-            current_price: *prices.last().unwrap_or(&0.0),
+            current_price,
             block_number: 0,
             timestamp: Instant::now(),
         }

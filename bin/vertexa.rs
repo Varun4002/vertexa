@@ -1,17 +1,14 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use std::collections::VecDeque;
 use tracing::{info, warn, error};
 use tracing_subscriber::EnvFilter;
 
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
 
 use vertexa_core::{
-    Decision, MarketContext, MevThreatAssessment, PlannedTrade, PriceSeries,
-    Signal, Vote, ExecutionRoute, PendingTx, UNISWAP_V3_ROUTER, FixedUsd, VertexaError,
+    Decision, MarketContext, PlannedTrade, PriceSeries,
+    Signal, Vote, ExecutionRoute, FixedUsd,
 };
 use vertexa_ingestion::{price_feed, pool_reader, context_builder::ContextBuilder};
 use vertexa_signals::{RsiSignal, EmaCrossoverSignal, OrderBookSignal, OnchainFlowSignal};
@@ -30,6 +27,7 @@ struct AppConfig {
 }
 
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct NetworkConfig {
     rpc_http: String,
     rpc_ws: String,
@@ -47,6 +45,7 @@ struct TradingConfig {
 }
 
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct RiskTomlConfig {
     daily_loss_limit_usd: f64,
     max_slippage_public: f64,
@@ -56,6 +55,7 @@ struct RiskTomlConfig {
 }
 
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct MevConfig {
     flashbots_relay_url: String,
     known_bot_addresses: Vec<String>,
@@ -85,14 +85,13 @@ async fn main() -> eyre::Result<()> {
         "VERTEXA — Autonomous DEX Trading Bot"
     );
 
-    println!("{}", r#"
-█████╗ ███████╗██████╗ ████████╗███████╗██╗  ██╗ █████╗
+    println!(
+"█████╗ ███████╗██████╗ ████████╗███████╗██╗  ██╗ █████╗
 ██╔══██╗██╔════╝██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝██╔══██╗
 ███████║█████╗  ██████╔╝   ██║   █████╗   ╚███╔╝ ███████║
 ██╔══██║██╔══╝  ██╔══██╗   ██║   ██╔══╝   ██╔██╗ ██╔══██║
 ██║  ██║███████╗██║  ██║   ██║   ███████╗██╔╝ ██╗██║  ██║
-╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
-    "#);
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝");
 
     dotenvy::dotenv().ok();
 
@@ -122,12 +121,14 @@ async fn main() -> eyre::Result<()> {
     let price_series = Arc::new(RwLock::new(PriceSeries::new(100)));
     let pool_price = Arc::new(RwLock::new(0.0_f64));
     let pool_liquidity = Arc::new(RwLock::new(0.0_f64));
+    let block_number = Arc::new(RwLock::new(0u64));
 
     price_feed::start(price_series.clone()).await;
 
     pool_reader::start(
         pool_price.clone(),
         pool_liquidity.clone(),
+        block_number.clone(),
         &app_cfg.network.rpc_http,
     ).await;
 
@@ -141,6 +142,7 @@ async fn main() -> eyre::Result<()> {
         pool_price,
         pool_liquidity,
         pending_txs.clone(),
+        block_number,
     );
 
     let signals: Vec<Box<dyn Signal>> = vec![
@@ -172,7 +174,14 @@ async fn main() -> eyre::Result<()> {
     risk_checker.start_midnight_reset();
 
     let swap_builder = SwapBuilder::new(signer.address());
-    let broadcaster = Broadcaster::new(&app_cfg.network.rpc_http);
+
+    let flashbots_relay = FlashbotsRelay::new(&app_cfg.mev.flashbots_relay_url);
+    let split_executor = SplitExecutor::new(app_cfg.risk.min_chunk_usd);
+    let broadcaster = Broadcaster::new(
+        &app_cfg.network.rpc_http,
+        flashbots_relay,
+        split_executor,
+    );
 
     let loop_interval = Duration::from_secs(app_cfg.trading.loop_interval_s);
 
@@ -291,7 +300,7 @@ fn build_planned_trade(
     cfg: &AppConfig,
     adjusted_usd: f64,
 ) -> PlannedTrade {
-    let amount_usd = adjusted_usd.min(1000.0);
+    let amount_usd = adjusted_usd;
     let amount_in_wei = (amount_usd * 1e18 / ctx.current_price) as u128;
 
     let max_slippage = if decision.avg_confidence > 0.7 {

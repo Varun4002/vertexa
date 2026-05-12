@@ -9,8 +9,8 @@ Autonomous DEX trading bot for Arbitrum with volatility regime detection, MEV pr
 Vertexa is a production-grade, modular trading bot that:
 
 1. **Ingests** on-chain market data (prices, volumes, orderbook, whale transactions)
-2. **Computes** 5 technical signals + volatility regime classification
-3. **Reaches consensus** via weighted voting with pre-gate regime filtering
+2. **Regime pre-filter** — ATR-based volatility classification (blocks ranging markets)
+3. **Computes** 4 technical signals + majority vote consensus
 4. **Assesses MEV threats** from mempool scanning and sandwich detection
 5. **Checks profitability** (expected edge vs gas + slippage + MEV loss)
 6. **Enforces risk limits** (position limits, daily loss circuit breaker)
@@ -20,7 +20,7 @@ Vertexa is a production-grade, modular trading bot that:
 
 ## Features
 
-### Signals
+### Voting Signals
 
 | Signal | Description | Parameters |
 |--------|-------------|------------|
@@ -28,9 +28,8 @@ Vertexa is a production-grade, modular trading bot that:
 | **EMA Crossover** | 9/21 EMA crossover detection | Fast=9, Slow=21 |
 | **OrderBook Imbalance** | Bid/ask depth imbalance | Weighted by price level |
 | **Onchain Flow** | Whale transaction tracking | Filter by USD value threshold |
-| **Volatility Regime** | ATR-based market classification | Period 14, thresholds 0.8% and 2.5% |
 
-### Volatility Regime Filter
+### Volatility Regime Pre-Gate
 
 Prevents false signals in ranging markets and reduces size in volatile markets.
 
@@ -179,7 +178,11 @@ min_confidence = 0.35
 
 **Private Key:**
 
-The bot expects a standard Ethereum private key in the environment. Configure via your wallet or key management solution.
+| Variable | Purpose |
+|----------|---------|
+| `VERTEXA_PRIVATE_KEY` | Ethereum private key for signing transactions |
+
+The bot expects `VERTEXA_PRIVATE_KEY` in the environment or a `.env` file. Required unless running in paper mode.
 
 ---
 

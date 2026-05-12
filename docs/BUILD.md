@@ -44,7 +44,7 @@ See `config/default.toml` for all settings:
 |---|---|---|
 | `VERTEXA_RPC_WS` | No | Override WebSocket RPC URL |
 | `VERTEXA_PAPER` | No | Set to `true` to enable paper trading |
-| `PRIVATE_KEY` | Yes* | Wallet private key (for real trading) |
+| `VERTEXA_PRIVATE_KEY` | Yes* | Ethereum private key for signing transactions |
 
 \* Required unless running in paper trade mode.
 

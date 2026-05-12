@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use futures::StreamExt;
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
 use alloy::consensus::Transaction;
 use alloy::network::TransactionResponse;
 use tracing::{info, warn, error};

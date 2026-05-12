@@ -9,7 +9,6 @@ use std::time::Duration;
 use vertexa_core::PriceSeries;
 
 const BINANCE_WS: &str = "wss://stream.binance.com:9443/ws/ethusdt@kline_1m";
-const USER_AGENT: &str = "VERTEXA/0.1.0";
 
 pub async fn start(shared: Arc<RwLock<PriceSeries>>) {
     tokio::spawn(async move {

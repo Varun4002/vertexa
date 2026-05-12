@@ -7,6 +7,15 @@ impl RsiSignal {
     pub fn new() -> Self {
         Self
     }
+}
+
+impl Default for RsiSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RsiSignal {
 
     fn calculate_rsi(prices: &[f64], period: usize) -> Option<f64> {
         if prices.len() < period + 1 {

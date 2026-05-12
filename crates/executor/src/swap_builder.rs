@@ -2,9 +2,8 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use alloy::primitives::{Address, U256, Uint, Bytes};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::network::TransactionBuilder;
 use alloy::rpc::types::TransactionRequest;
-use tracing::{info, warn};
+use tracing::info;
 
 use vertexa_core::{PlannedTrade, UNISWAP_V3_ROUTER, UNISWAP_V3_QUOTER};
 
@@ -54,7 +53,7 @@ impl SwapBuilder {
         let quote_amount = self.fetch_quote(
             trade.token_in,
             trade.token_out,
-            trade.pool_fee as u32,
+            trade.pool_fee,
             trade.amount_in,
             rpc_url,
         ).await?;

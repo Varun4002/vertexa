@@ -76,7 +76,7 @@ impl ConsensusEngine {
             (Vote::Sell, sells)
         } else if neutrals.len() >= self.required_votes {
             (Vote::Neutral, neutrals)
-        } else if buys.len() == sells.len() && buys.len() > 0 {
+        } else if buys.len() == sells.len() && !buys.is_empty() {
             let buy_avg_conf: f64 = buys.iter().map(|r| r.confidence).sum::<f64>() / buys.len() as f64;
             let sell_avg_conf: f64 = sells.iter().map(|r| r.confidence).sum::<f64>() / sells.len() as f64;
 

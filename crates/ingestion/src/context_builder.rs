@@ -1,21 +1,22 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use vertexa_core::{
-    MarketContext, OrderBook, PriceLevel, PriceSeries, WhaleTx, PendingTx,
-    WETH_ADDRESS, USDC_ADDRESS,
+    MarketContext, PriceSeries, WhaleTx, PendingTx,
+    USDC_ADDRESS,
 };
-use tracing::{warn, info, error};
+use tracing::warn;
 
-const STALE_THRESHOLD: Duration = Duration::from_secs(60);
+use crate::orderbook;
 
 pub struct ContextBuilder {
     price_series: Arc<RwLock<PriceSeries>>,
     pool_price: Arc<RwLock<f64>>,
     pool_liquidity: Arc<RwLock<f64>>,
     pending_txs: Arc<RwLock<VecDeque<PendingTx>>>,
+    block_number: Arc<RwLock<u64>>,
 }
 
 impl ContextBuilder {
@@ -24,12 +25,14 @@ impl ContextBuilder {
         pool_price: Arc<RwLock<f64>>,
         pool_liquidity: Arc<RwLock<f64>>,
         pending_txs: Arc<RwLock<VecDeque<PendingTx>>>,
+        block_number: Arc<RwLock<u64>>,
     ) -> Self {
         Self {
             price_series,
             pool_price,
             pool_liquidity,
             pending_txs,
+            block_number,
         }
     }
 
@@ -39,7 +42,6 @@ impl ContextBuilder {
             if series.closes.is_empty() {
                 return Err("price series is empty".into());
             }
-            let age = series.closes.last().map(|_| Instant::now()).unwrap_or(Instant::now());
             series.closes.clone()
         };
 
@@ -66,32 +68,14 @@ impl ContextBuilder {
             }
         };
 
-        let bid_count = 20;
-        let ask_count = 20;
-        let spread = current_price * 0.0005;
-
-        let bids: Vec<PriceLevel> = (0..bid_count)
-            .map(|i| PriceLevel {
-                price: current_price - spread * (i as f64 + 1.0),
-                size: (pool_liquidity / 2000.0) * (bid_count - i) as f64 / bid_count as f64,
-            })
-            .collect();
-
-        let asks: Vec<PriceLevel> = (0..ask_count)
-            .map(|i| PriceLevel {
-                price: current_price + spread * (i as f64 + 1.0),
-                size: (pool_liquidity / 2000.0) * (i + 1) as f64 / ask_count as f64,
-            })
-            .collect();
-
-        let orderbook = OrderBook { bids, asks };
+        let orderbook = orderbook::build_orderbook(0, pool_liquidity, current_price);
 
         let recent_whale_txs = {
             let txs = self.pending_txs.read().await;
             estimate_whale_txs(&txs, current_price)
         };
 
-        let block_number = 0;
+        let block_number = *self.block_number.read().await;
 
         Ok(MarketContext {
             pair: pair.to_string(),

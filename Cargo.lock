@@ -4847,6 +4847,7 @@ dependencies = [
  "eyre",
  "futures",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4855,6 +4856,7 @@ dependencies = [
  "vertexa-executor",
  "vertexa-ingestion",
  "vertexa-mev-guard",
+ "vertexa-notify",
  "vertexa-risk",
  "vertexa-signals",
 ]
@@ -4928,6 +4930,18 @@ dependencies = [
  "hex",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "vertexa-core",
+]
+
+[[package]]
+name = "vertexa-notify"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "reqwest 0.12.28",
  "serde_json",
  "tokio",
  "tracing",

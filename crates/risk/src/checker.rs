@@ -32,6 +32,46 @@ impl RiskChecker {
         }
     }
 
+    pub fn new_with_state(
+        config: &RiskConfig,
+        daily_loss_cents: u64,
+        circuit_breaker_active: bool,
+        current_position_cents: u64,
+    ) -> Self {
+        let checker = Self {
+            max_trade_usd: config.max_trade_usd,
+            max_position_usd: config.max_position_usd,
+            daily_loss_limit_usd: config.daily_loss_limit_usd,
+            current_position: AtomicU64::new(current_position_cents),
+            daily_loss: AtomicU64::new(daily_loss_cents),
+            circuit_breaker_active: AtomicU64::new(if circuit_breaker_active { 1 } else { 0 }),
+            last_reset: Arc::new(std::sync::Mutex::new(Utc::now())),
+            profitability: ProfitabilityCheck::new(),
+        };
+
+        if circuit_breaker_active {
+            tracing::warn!(
+                target: "vertexa",
+                daily_loss_cents,
+                "circuit breaker restored from persisted state"
+            );
+        }
+
+        checker
+    }
+
+    pub fn daily_loss(&self) -> u64 {
+        self.daily_loss.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn is_circuit_breaker_active(&self) -> bool {
+        self.circuit_breaker_active.load(std::sync::atomic::Ordering::SeqCst) == 1
+    }
+
+    pub fn current_position_cents(&self) -> u64 {
+        self.current_position.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn check_profitability(
         &self,
         trade: &PlannedTrade,
@@ -136,15 +176,21 @@ impl RiskChecker {
             loop {
                 ticker.tick().await;
                 let now = Utc::now();
-                let should_reset = {
-                    let last = checker.last_reset.lock().unwrap();
-                    now.date_naive() != last.date_naive()
+                let should_reset = match checker.last_reset.lock() {
+                    Ok(last) => now.date_naive() != last.date_naive(),
+                    Err(_) => {
+                        warn!(target: "vertexa", "mutex poisoned — skipping midnight reset check");
+                        false
+                    }
                 };
 
                 if should_reset {
                     checker.daily_loss.store(0, Ordering::SeqCst);
                     checker.circuit_breaker_active.store(0, Ordering::SeqCst);
-                    *checker.last_reset.lock().unwrap() = now;
+                    match checker.last_reset.lock() {
+                        Ok(mut last) => *last = now,
+                        Err(_) => warn!(target: "vertexa", "mutex poisoned — could not update reset time"),
+                    }
                     info!(target: "vertexa", "daily loss counter reset at midnight");
                 }
             }

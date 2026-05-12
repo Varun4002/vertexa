@@ -19,7 +19,7 @@ cargo build --release
 cargo check
 ```
 
-The workspace compiles 7 crates + 1 binary. First build will download dependencies.
+The workspace compiles 8 crates + 1 binary. First build will download dependencies.
 
 ## Configuration
 
@@ -37,6 +37,7 @@ See `config/default.toml` for all settings:
 - **`[risk]`** — Slippage tolerances, daily loss limit, min chunk size
 - **`[mev]`** — Flashbots relay URL, known bot addresses, mempool buffer
 - **`[consensus]`** — Required signal votes, minimum confidence
+- **`[notify]`** — Discord webhook URL for trade notifications (optional)
 
 ## Environment Variables
 
@@ -48,7 +49,30 @@ See `config/default.toml` for all settings:
 
 \* Required unless running in paper trade mode.
 
-The signer reads from `PRIVATE_KEY` environment variable or a `.env` file.
+## Discord Notifications
+
+Add this to your config to receive trade notifications on Discord:
+
+```toml
+[notify]
+discord_webhook_url = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+```
+
+The notifier is optional — if the `[notify]` section is omitted, no webhook calls are made. Notifications fire asynchronously and do not block the main loop.
+
+Bot sends embeds for:
+- **Successful trades** (green) — action, amount, route, risk score, tx hash
+- **Failed trades** (orange) — action, amount, reason (MEV abort, profitability gate, risk gate)
+- **Execution errors** (orange) — error details
+
+## State Persistence
+
+On graceful shutdown (SIGINT/SIGTERM), the bot saves:
+- Daily loss counter
+- Circuit breaker status
+- Position tracking
+
+to `vertexa_state.json` in the working directory. State is automatically restored on next startup.
 
 ## Running
 
@@ -61,6 +85,16 @@ cargo run --release
 
 # With custom RPC
 VERTEXA_RPC_WS=wss://my-custom-arbitrum-node.com/ws cargo run --release
+
+# Stop gracefully: Ctrl+C (state will be saved)
+```
+
+## Validation
+
+```bash
+cargo check --workspace
+cargo clippy --workspace -- -D warnings
+cargo test --workspace   # 36 tests
 ```
 
 ## Project Layout
@@ -77,7 +111,8 @@ Vertexa/
 │   ├── consensus/          # Decision engine
 │   ├── mev_guard/          # MEV protection
 │   ├── risk/               # Risk management
-│   └── executor/           # Trade execution
+│   ├── executor/           # Trade execution
+│   └── notify/             # Discord webhook notifications
 ├── bin/
 │   ├── Cargo.toml
 │   └── vertexa.rs          # Binary entrypoint

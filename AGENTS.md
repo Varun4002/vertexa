@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Vertexa is an autonomous DEX trading bot for Arbitrum. It ingests on-chain market data, computes technical signals (RSI, EMA crossover, orderbook imbalance, onchain flow, volatility regime), reaches consensus via weighted voting with pre-gate regime filtering, assesses MEV threats, checks profitability (gas + slippage + MEV vs expected edge), checks risk limits, and executes swaps through the public mempool, Flashbots, or split execution.
+Vertexa is an autonomous DEX trading bot for Arbitrum. It ingests on-chain market data, computes technical signals (RSI, EMA crossover, orderbook imbalance, onchain flow, volatility regime), reaches consensus via weighted voting with pre-gate regime filtering, assesses MEV threats, checks profitability (gas + slippage + MEV vs expected edge), checks risk limits, sends Discord notifications, and executes swaps through the public mempool, Flashbots, or split execution. It supports graceful shutdown (SIGINT/SIGTERM) with state persistence.
 
 ## Workspace Structure
 
@@ -14,10 +14,11 @@ crates/consensus/  Consensus engine — aggregates signal votes, regime pre-gate
 crates/mev_guard/  MEV protection — mempool monitor, Flashbots relay, split executor
 crates/risk/       Risk checking — position limits, daily loss limits, profitability gate
 crates/executor/   Execution — swap builder, tx signer, broadcaster
+crates/notify/     Notifications — Discord webhook notifier
 bin/               Binary entrypoint (vertexa.rs)
 ```
 
-## Key Types Added
+## Key Types
 
 - `FixedUsd` — Explicit money wrapper around `f64` with `from_dollars()`, `to_dollars()`, `Add`, `Sub`, `Display`
 - `Regime` — `Ranging`, `Trending`, `Volatile` (volatility classification)
@@ -26,6 +27,7 @@ bin/               Binary entrypoint (vertexa.rs)
   - `blocked_by: Option<&'static str>` — reason if blocked
 - `CostBreakdown` — gas + slippage + MEV cost analysis
 - `VertexaError::TradeNotProfitable { reward_to_cost, minimum }`
+- `TradeNotification` — Discord-ready notification struct with action, amount, route, risk, tx hash
 
 ## Key Conventions
 
@@ -36,6 +38,8 @@ bin/               Binary entrypoint (vertexa.rs)
 - **Web3:** Alloy framework
 - **Target:** Arbitrum (chain ID 42161)
 - **Money arithmetic:** Use `FixedUsd`, not raw `f64` for financial values
+- **Notifications:** Discord webhook via `vertexa-notify` crate (optional — configured in `[notify]` config section)
+- **Persistence:** State saved to `vertexa_state.json` on graceful shutdown, restored on startup
 
 ## Signals
 
@@ -97,8 +101,11 @@ Decision:
 7. MEV assessment → mev_assessment (MOVED BEFORE risk checks)
 8. PROFITABILITY CHECK (uses MEV estimate)
 9. Existing risk.check()
-10. Execute via recommended route
+10. Notify (Discord webhook on success/failure/abort)
+11. Execute via recommended route
 ```
+
+Shutdown (SIGINT/SIGTERM): Persists state (daily_loss, circuit_breaker, position) to `vertexa_state.json` before exit. State is restored on next startup.
 
 ## Build & Run
 
@@ -116,12 +123,23 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
+## Tests
+
+36 total (up from 26):
+- core: 7 (FixedUsd arithmetic, PriceSeries)
+- ingestion: 2 (orderbook)
+- signals: 13 (RSI:4, EMA:3, OB:3, Onchain:3)
+- consensus: 4 (majority, tie, confidence gate, regime pre-gate)
+- mev_guard: 5 (guard:2, split:3)
+- risk: 3 (checker)
+- notify: 2 (Discord payload building)
+
 ## Agent Rules
 
 - Read existing files before modifying them
 - Type mismatches will break compilation. Match existing types exactly.
 - `FixedUsd` for all money. Never `f64` for financial arithmetic.
-- No `unwrap()`, no `expect()`, no `todo!()`, no `unimplemented!()`
+- No `unwrap()`, no `expect()`, no `todo!()`, no `unimplemented!()`, no `unreachable!()`
 - No new dependencies unless justified
 - Do not reformat, rename, or restructure existing code not explicitly listed
 - Every new tracing log must include `target: "vertexa"`

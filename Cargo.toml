@@ -8,6 +8,7 @@ members = [
     "crates/mev_guard",
     "crates/risk",
     "crates/executor",
+    "crates/notify",
     "bin",
 ]
 

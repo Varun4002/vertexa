@@ -1,6 +1,6 @@
 # Vertexa
 
-Autonomous DEX trading bot for Arbitrum with volatility regime detection, MEV protection, and gas-adjusted profitability gating.
+Autonomous DEX trading bot for Arbitrum with volatility regime detection, MEV protection, gas-adjusted profitability gating, Discord notifications, and graceful shutdown with state persistence.
 
 ---
 
@@ -15,6 +15,9 @@ Vertexa is a production-grade, modular trading bot that:
 5. **Checks profitability** (expected edge vs gas + slippage + MEV loss)
 6. **Enforces risk limits** (position limits, daily loss circuit breaker)
 7. **Executes** via optimal route: public mempool, Flashbots bundle, or split execution
+8. **Notifies** via Discord webhook on trade attempts (success/failure/abort)
+9. **Persists state** to disk and restores on restart (daily loss, circuit breaker, position)
+10. **Shuts down gracefully** on SIGINT/SIGTERM — saves state before exit
 
 ---
 
@@ -81,6 +84,28 @@ Three execution routes based on threat assessment:
 | **Split Execution** | Large orders that can't be atomic |
 | **Abort** | MEV threat exceeds acceptable threshold |
 
+### Notifications
+
+Sends Discord webhook embeds for every trade attempt:
+
+- **Success**: Green embed with action, amount, route, risk metrics, tx hash
+- **Failure**: Orange embed with error reason
+- **Abort**: Orange embed with reason (MEV, profitability, risk gate)
+
+Configure by adding a `[notify]` section to your config:
+
+```toml
+[notify]
+discord_webhook_url = "https://discord.com/api/webhooks/..."
+```
+
+### Graceful Shutdown
+
+- Traps SIGINT (Ctrl+C) and SIGTERM
+- Persists daily loss counter, circuit breaker state, and position tracking to `vertexa_state.json`
+- Restores state on next startup
+- Exits cleanly without mid-trade interruption
+
 ---
 
 ## Architecture
@@ -103,22 +128,23 @@ Three execution routes based on threat assessment:
 │  │  6. MEV assessment (mev_guard)                         │   │
 │  │  7. PROFITABILITY CHECK (uses MEV estimate)            │   │
 │  │  8. Existing risk checks                                │   │
-│  │  9. Execute via recommended route                       │   │
+│  │  9. Notify (Discord webhook)                            │   │
+│  │  10. Execute via recommended route                       │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 
-                        CRATE LAYOUT:
+                         CRATE LAYOUT:
 
-┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐
-│  core    │  │ signals  │  │ consensus │  │  ingestion│
-├──────────┤  ├──────────┤  ├───────────┤  ├───────────┤
-│ types    │  │ rsi      │  │ engine    │  │price_feed │
-│ signal   │  │ ema      │  │           │  │pool_reader│
-│ errors   │  │ orderbook│  │           │  │context_bld│
-│          │  │onchain_flow│ │           │  │           │
-│          │  │volatility_  │ │           │  │           │
-│          │  │  regime    │ │           │  │           │
-└──────────┘  └──────────┘  └───────────┘  └───────────┘
+┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐
+│  core    │  │ signals  │  │ consensus │  │ ingestion │  │  notify   │
+├──────────┤  ├──────────┤  ├───────────┤  ├───────────┤  ├───────────┤
+│ types    │  │ rsi      │  │ engine    │  │price_feed │  │ notifier  │
+│ signal   │  │ ema      │  │           │  │pool_reader│  │           │
+│ errors   │  │ orderbook│  │           │  │context_bld│  │           │
+│          │  │onchain_flow│ │           │  │           │  │           │
+│          │  │volatility_  │ │           │  │           │  │           │
+│          │  │  regime    │ │           │  │           │  │           │
+└──────────┘  └──────────┘  └───────────┘  └───────────┘  └───────────┘
 
 ┌──────────┐  ┌──────────┐  ┌───────────┐
 │mev_guard │  │  risk    │  │ executor  │
@@ -167,6 +193,9 @@ mempool_buffer_size = 500
 [consensus]
 required_votes = 3
 min_confidence = 0.35
+
+[notify]
+discord_webhook_url = "https://discord.com/api/webhooks/..."
 ```
 
 **Environment Variables:**
@@ -223,7 +252,7 @@ cargo check --workspace
 # Run lints
 cargo clippy --workspace -- -D warnings
 
-# Run tests
+# Run tests (36 total)
 cargo test --workspace
 ```
 
@@ -292,13 +321,21 @@ cargo test --workspace
 └──────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
-│                    8. EXECUTION                                │
+│                    8. NOTIFY                                  │
+│  ├── Discord webhook embed — success, failure, or abort      │
+│  └── Includes action, amount, route, risk score, tx hash     │
+└──────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────┐
+│                    9. EXECUTION                                │
 │  ├── Build Uniswap V3 swap calldata                          │
 │  ├── Sign transaction with private key                        │
 │  ├── Broadcast via recommended route                          │
 │  └── Record trade for position tracking                       │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+State persistence and graceful shutdown wrap the entire loop — state is saved to `vertexa_state.json` on SIGINT/SIGTERM and restored on next startup.
 
 ---
 
@@ -311,6 +348,7 @@ cargo test --workspace
 | Error Handling | `eyre` (app), `thiserror` (libraries) |
 | Config | `config-rs` + `dotenvy` |
 | Logging | `tracing` (JSON output) |
+| Notifications | Discord webhooks via `reqwest` |
 | Target Chain | Arbitrum (Chain ID 42161) |
 
 ---
@@ -322,6 +360,7 @@ Vertexa/
 ├── AGENTS.md           # AI agent context / dev conventions
 ├── Cargo.toml          # Workspace manifest
 ├── README.md           # This file
+├── vertexa_state.json  # Persisted state (auto-generated)
 ├── bin/
 │   └── vertexa.rs      # Main entrypoint & loop
 ├── config/
@@ -333,7 +372,8 @@ Vertexa/
     ├── ingestion/      # Data collection
     ├── mev_guard/      # MEV detection & routing
     ├── risk/           # Risk checks + profitability gate
-    └── executor/       # Swap building & broadcasting
+    ├── executor/       # Swap building & broadcasting
+    └── notify/         # Discord webhook notifications
 ```
 
 ---
@@ -343,7 +383,7 @@ Vertexa/
 1. **Always test in paper mode first** (`VERTEXA_PAPER=true`)
 2. **Start with small position sizes**
 3. **Set conservative daily loss limits**
-4. **Monitor logs continuously**
+4. **Monitor logs and Discord notifications continuously**
 5. **Understand that past performance ≠ future results**
 
 ---

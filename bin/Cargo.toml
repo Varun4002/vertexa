@@ -15,6 +15,7 @@ vertexa-consensus = { path = "../crates/consensus" }
 vertexa-mev-guard = { path = "../crates/mev_guard" }
 vertexa-risk = { path = "../crates/risk" }
 vertexa-executor = { path = "../crates/executor" }
+vertexa-notify = { path = "../crates/notify" }
 alloy.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -25,3 +26,4 @@ config.workspace = true
 eyre.workspace = true
 dotenvy.workspace = true
 chrono.workspace = true
+serde_json.workspace = true

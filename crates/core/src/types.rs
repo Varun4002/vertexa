@@ -157,3 +157,61 @@ pub const USDC_ADDRESS: Address = address!("af88d065e77c8cC2239327C5EDb3A432268e
 pub const UNISWAP_V3_ROUTER: Address = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
 pub const UNISWAP_V3_QUOTER: Address = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
 pub const ARBITRUM_CHAIN_ID: u64 = 42161;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fixed_usd_from_dollars() {
+        let amount = FixedUsd::from_dollars(100.50);
+        assert!((amount.to_dollars() - 100.50).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fixed_usd_display() {
+        let amount = FixedUsd::from_dollars(1234.56);
+        assert_eq!(format!("{amount}"), "$1234.56");
+    }
+
+    #[test]
+    fn test_fixed_usd_add() {
+        let a = FixedUsd::from_dollars(100.0);
+        let b = FixedUsd::from_dollars(50.0);
+        let c = a + b;
+        assert!((c.to_dollars() - 150.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fixed_usd_sub() {
+        let a = FixedUsd::from_dollars(100.0);
+        let b = FixedUsd::from_dollars(30.0);
+        let c = a - b;
+        assert!((c.to_dollars() - 70.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fixed_usd_negative_not_allowed() {
+        let amount = FixedUsd::from_dollars(-50.0);
+        assert!(amount.to_dollars() < 0.0);
+    }
+
+    #[test]
+    fn test_price_series_push_and_capacity() {
+        let mut series = PriceSeries::new(5);
+        for i in 0..10 {
+            series.push(i as f64, (i * 2) as f64);
+        }
+        assert_eq!(series.closes.len(), 5);
+        assert_eq!(series.closes[0], 5.0);
+        assert_eq!(series.closes[4], 9.0);
+        assert_eq!(series.volumes.len(), 5);
+    }
+
+    #[test]
+    fn test_price_series_empty() {
+        let series = PriceSeries::new(100);
+        assert!(series.closes.is_empty());
+        assert!(series.volumes.is_empty());
+    }
+}

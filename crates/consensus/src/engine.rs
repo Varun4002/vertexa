@@ -50,7 +50,10 @@ impl ConsensusEngine {
         let size_multiplier = match regime {
             Regime::Trending => 1.0,
             Regime::Volatile => 0.5,
-            Regime::Ranging => unreachable!(),
+            Regime::Ranging => {
+                info!(target: "vertexa", "Ranging regime unexpectedly reached size_multiplier — defaulting to 0.0");
+                0.0
+            }
         };
 
         let futures = self.signals.iter().map(|s| s.evaluate(ctx));
@@ -225,4 +228,35 @@ mod tests {
         let decision = engine.evaluate(&make_ctx()).await;
         assert_eq!(decision.action, Vote::Neutral);
     }
+
+    #[tokio::test]
+    async fn test_regime_pregate_blocks_ranging() {
+        let prices: Vec<f64> = (0..30).map(|_| 3000.0).collect();
+        let current_price = 3000.0;
+        let ctx = MarketContext {
+            pair: "ETH/USDC".into(),
+            pool_address: Default::default(),
+            prices,
+            volumes: vec![],
+            orderbook: OrderBook { bids: vec![], asks: vec![] },
+            recent_whale_txs: vec![],
+            pool_liquidity: 10_000_000.0,
+            current_price,
+            block_number: 0,
+            timestamp: Instant::now(),
+        };
+
+        let signals: Vec<Box<dyn Signal>> = vec![
+            Box::new(TestSignal { name: "A", vote: Vote::Buy, confidence: 0.8 }),
+            Box::new(TestSignal { name: "B", vote: Vote::Buy, confidence: 0.7 }),
+            Box::new(TestSignal { name: "C", vote: Vote::Buy, confidence: 0.9 }),
+            Box::new(TestSignal { name: "D", vote: Vote::Buy, confidence: 0.85 }),
+        ];
+        let engine = ConsensusEngine::new(signals, 3, 0.35);
+        let decision = engine.evaluate(&ctx).await;
+        assert_eq!(decision.action, Vote::Neutral);
+        assert_eq!(decision.blocked_by, Some("VolatilityRegime::Ranging"));
+        assert_eq!(decision.size_multiplier, 0.0);
+    }
+
 }

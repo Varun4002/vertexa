@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::signal;
 use tracing::{info, warn, error};
 use tracing_subscriber::EnvFilter;
 
@@ -16,6 +17,17 @@ use vertexa_consensus::ConsensusEngine;
 use vertexa_mev_guard::{MempoolMonitor, FlashbotsRelay, SplitExecutor, MevGuard};
 use vertexa_risk::{RiskChecker, RiskConfig};
 use vertexa_executor::{SwapBuilder, TxSigner, Broadcaster};
+use vertexa_notify::{Notifier, TradeNotification};
+
+const STATE_FILE: &str = "vertexa_state.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PersistentState {
+    daily_loss_cents: u64,
+    circuit_breaker_active: bool,
+    current_position_cents: u64,
+    last_updated: String,
+}
 
 #[derive(serde::Deserialize, Debug)]
 struct AppConfig {
@@ -24,13 +36,14 @@ struct AppConfig {
     risk: RiskTomlConfig,
     mev: MevConfig,
     consensus: ConsensusConfig,
+    notify: Option<NotifyConfig>,
 }
 
 #[derive(serde::Deserialize, Debug)]
-#[allow(dead_code)]
 struct NetworkConfig {
     rpc_http: String,
     rpc_ws: String,
+    #[allow(dead_code)]
     chain_id: u64,
 }
 
@@ -45,11 +58,11 @@ struct TradingConfig {
 }
 
 #[derive(serde::Deserialize, Debug)]
-#[allow(dead_code)]
 struct RiskTomlConfig {
     daily_loss_limit_usd: f64,
     max_slippage_public: f64,
     max_slippage_flashbots: f64,
+    #[allow(dead_code)]
     max_slippage_split: f64,
     min_chunk_usd: f64,
 }
@@ -66,6 +79,11 @@ struct MevConfig {
 struct ConsensusConfig {
     required_votes: usize,
     min_confidence: f64,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct NotifyConfig {
+    discord_webhook_url: String,
 }
 
 #[tokio::main]
@@ -89,7 +107,7 @@ async fn main() -> eyre::Result<()> {
 "█████╗ ███████╗██████╗ ████████╗███████╗██╗  ██╗ █████╗
 ██╔══██╗██╔════╝██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝██╔══██╗
 ███████║█████╗  ██████╔╝   ██║   █████╗   ╚███╔╝ ███████║
-██╔══██║██╔══╝  ██╔══██╗   ██║   ██╔══╝   ██╔██╗ ██╔══██║
+██╔══██║██╔══╝  ██╔══██╗   ██║   ██╔══╝   ██╔██╗ ██║  ██║
 ██║  ██║███████╗██║  ██║   ██║   ███████╗██╔╝ ██╗██║  ██║
 ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝");
 
@@ -170,8 +188,23 @@ async fn main() -> eyre::Result<()> {
         max_position_usd: app_cfg.trading.max_position_usd,
         daily_loss_limit_usd: app_cfg.risk.daily_loss_limit_usd,
     };
-    let risk_checker = Arc::new(RiskChecker::new(&risk_config));
+
+    let persisted = load_state();
+    let (daily_loss_cents, circuit_breaker, position_cents) = match persisted {
+        Some(s) => (s.daily_loss_cents, s.circuit_breaker_active, s.current_position_cents),
+        None => (0, false, 0),
+    };
+    let risk_checker = Arc::new(RiskChecker::new_with_state(
+        &risk_config,
+        daily_loss_cents,
+        circuit_breaker,
+        position_cents,
+    ));
     risk_checker.start_midnight_reset();
+
+    let notifier = Notifier::new(
+        app_cfg.notify.as_ref().map(|n| n.discord_webhook_url.clone()),
+    );
 
     let swap_builder = SwapBuilder::new(signer.address());
 
@@ -194,102 +227,215 @@ async fn main() -> eyre::Result<()> {
         "main loop starting"
     );
 
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("failed to register SIGTERM handler");
+
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                info!(target: "vertexa", "SIGINT received — initiating graceful shutdown");
+            }
+            _ = sigterm.recv() => {
+                info!(target: "vertexa", "SIGTERM received — initiating graceful shutdown");
+            }
+        }
+
+        shutdown_clone.notify_one();
+    });
+
     loop {
-        tokio::time::sleep(loop_interval).await;
-
-        let ctx = match context_builder.build(
-            &app_cfg.trading.pair,
-            pool_address,
-        ).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                warn!(target: "vertexa", error = %e, "failed to build market context");
-                continue;
+        tokio::select! {
+            _ = shutdown.notified() => {
+                info!(target: "vertexa", "shutting down gracefully...");
+                let state = PersistentState {
+                    daily_loss_cents: risk_checker.daily_loss(),
+                    circuit_breaker_active: risk_checker.is_circuit_breaker_active(),
+                    current_position_cents: risk_checker.current_position_cents(),
+                    last_updated: chrono::Utc::now().to_rfc3339(),
+                };
+                save_state(&state);
+                info!(target: "vertexa", "state persisted — goodbye");
+                break;
             }
-        };
-
-        let decision = engine.evaluate(&ctx).await;
-
-        if decision.action == Vote::Neutral {
-            continue;
+            _ = tokio::time::sleep(loop_interval) => {
+                run_loop_iteration(
+                    &context_builder,
+                    &engine,
+                    &mev_guard,
+                    &risk_checker,
+                    &swap_builder,
+                    &broadcaster,
+                    &signer,
+                    &notifier,
+                    &app_cfg,
+                    pool_address,
+                    is_paper,
+                ).await;
+            }
         }
+    }
 
-        let adjusted_usd = app_cfg.trading.max_trade_usd * decision.size_multiplier;
+    Ok(())
+}
 
-        if adjusted_usd < 10.0 {
-            warn!(target: "vertexa", "Adjusted trade size too small, skipping");
-            continue;
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_iteration(
+    context_builder: &ContextBuilder,
+    engine: &ConsensusEngine,
+    mev_guard: &MevGuard,
+    risk_checker: &RiskChecker,
+    swap_builder: &SwapBuilder,
+    broadcaster: &Broadcaster,
+    signer: &TxSigner,
+    notifier: &Notifier,
+    cfg: &AppConfig,
+    pool_address: Address,
+    is_paper: bool,
+) {
+    let ctx = match context_builder.build(&cfg.trading.pair, pool_address).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!(target: "vertexa", error = %e, "failed to build market context");
+            return;
         }
+    };
 
-        let trade = build_planned_trade(&decision, &ctx, &app_cfg, adjusted_usd);
+    let decision = engine.evaluate(&ctx).await;
 
-        let assessment = mev_guard.assess(&trade, ctx.pool_liquidity).await;
+    if decision.action == Vote::Neutral {
+        return;
+    }
 
-        if assessment.recommended_route == ExecutionRoute::Abort {
-            warn!(
+    let adjusted_usd = cfg.trading.max_trade_usd * decision.size_multiplier;
+
+    if adjusted_usd < 10.0 {
+        warn!(target: "vertexa", "adjusted trade size too small, skipping");
+        return;
+    }
+
+    let trade = build_planned_trade(&decision, &ctx, cfg, adjusted_usd);
+    let assessment = mev_guard.assess(&trade, ctx.pool_liquidity).await;
+
+    if assessment.recommended_route == ExecutionRoute::Abort {
+        warn!(
+            target: "vertexa",
+            risk_score = assessment.risk_score,
+            reason = "MEV guard aborted",
+            "TRADE ABORTED"
+        );
+        notifier.notify(&TradeNotification {
+            action: decision.action.clone(),
+            amount: FixedUsd::from_dollars(adjusted_usd),
+            route: "Abort".into(),
+            risk_score: assessment.risk_score,
+            sandwich_probability: assessment.sandwich_probability,
+            tx_hash: None,
+            success: false,
+            error: Some(format!("MEV guard aborted (risk {:.2})", assessment.risk_score)),
+            regime: None,
+            block_number: Some(ctx.block_number),
+        });
+        return;
+    }
+
+    if let Err(e) = risk_checker.check_profitability(
+        &trade,
+        decision.avg_confidence,
+        FixedUsd::from_dollars(assessment.estimated_mev_loss_usd),
+    ) {
+        warn!(
+            target: "vertexa",
+            error = %e,
+            "profitability check failed — skipping trade"
+        );
+        notifier.notify(&TradeNotification {
+            action: decision.action.clone(),
+            amount: FixedUsd::from_dollars(adjusted_usd),
+            route: "ProfitabilityGate".into(),
+            risk_score: assessment.risk_score,
+            sandwich_probability: assessment.sandwich_probability,
+            tx_hash: None,
+            success: false,
+            error: Some(e.to_string()),
+            regime: None,
+            block_number: Some(ctx.block_number),
+        });
+        return;
+    }
+
+    if let Err(e) = risk_checker.check(&trade, &assessment) {
+        warn!(
+            target: "vertexa",
+            error = %e,
+            "risk check failed — skipping trade"
+        );
+        notifier.notify(&TradeNotification {
+            action: decision.action.clone(),
+            amount: FixedUsd::from_dollars(adjusted_usd),
+            route: "RiskGate".into(),
+            risk_score: assessment.risk_score,
+            sandwich_probability: assessment.sandwich_probability,
+            tx_hash: None,
+            success: false,
+            error: Some(e),
+            regime: None,
+            block_number: Some(ctx.block_number),
+        });
+        return;
+    }
+
+    let tx = match swap_builder.build_tx(&trade, &cfg.network.rpc_http).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(target: "vertexa", error = %e, "failed to build swap tx");
+            return;
+        }
+    };
+
+    match broadcaster.broadcast(&tx, signer, &trade, &assessment, is_paper).await {
+        Ok(tx_hash) => {
+            info!(
                 target: "vertexa",
-                risk_score = assessment.risk_score,
-                reason = "MEV guard aborted",
-                "TRADE ABORTED"
+                tx_hash = %tx_hash,
+                action = ?decision.action,
+                amount_usd = trade.amount_usd,
+                route = ?assessment.recommended_route,
+                "trade executed"
             );
-            continue;
+            risk_checker.record_trade(trade.amount_usd, 0.0);
+
+            let notif = TradeNotification {
+                action: decision.action.clone(),
+                amount: FixedUsd::from_dollars(adjusted_usd),
+                route: format!("{:?}", assessment.recommended_route),
+                risk_score: assessment.risk_score,
+                sandwich_probability: assessment.sandwich_probability,
+                tx_hash: Some(tx_hash),
+                success: true,
+                error: None,
+                regime: None,
+                block_number: Some(ctx.block_number),
+            };
+            notifier.notify(&notif);
         }
-
-        if let Err(e) = risk_checker.check_profitability(
-            &trade,
-            decision.avg_confidence,
-            FixedUsd::from_dollars(assessment.estimated_mev_loss_usd),
-        ) {
-            warn!(
-                target: "vertexa",
-                error = %e,
-                "profitability check failed — skipping trade"
-            );
-            continue;
-        }
-
-        if let Err(e) = risk_checker.check(&trade, &assessment) {
-            warn!(
-                target: "vertexa",
-                error = %e,
-                "risk check failed — skipping trade"
-            );
-            continue;
-        }
-
-        let tx = match swap_builder.build_tx(&trade, &app_cfg.network.rpc_http).await {
-            Ok(tx) => tx,
-            Err(e) => {
-                warn!(target: "vertexa", error = %e, "failed to build swap tx");
-                continue;
-            }
-        };
-
-        match broadcaster.broadcast(
-            &tx,
-            &signer,
-            &trade,
-            &assessment,
-            is_paper,
-        ).await {
-            Ok(tx_hash) => {
-                info!(
-                    target: "vertexa",
-                    tx_hash = %tx_hash,
-                    action = ?decision.action,
-                    amount_usd = trade.amount_usd,
-                    route = ?assessment.recommended_route,
-                    "trade executed"
-                );
-                risk_checker.record_trade(trade.amount_usd, 0.0);
-            }
-            Err(e) => {
-                error!(
-                    target: "vertexa",
-                    error = %e,
-                    "trade execution failed"
-                );
-            }
+        Err(e) => {
+            error!(target: "vertexa", error = %e, "trade execution failed");
+            notifier.notify(&TradeNotification {
+                action: decision.action.clone(),
+                amount: FixedUsd::from_dollars(adjusted_usd),
+                route: format!("{:?}", assessment.recommended_route),
+                risk_score: assessment.risk_score,
+                sandwich_probability: assessment.sandwich_probability,
+                tx_hash: None,
+                success: false,
+                error: Some(e),
+                regime: None,
+                block_number: Some(ctx.block_number),
+            });
         }
     }
 }
@@ -323,5 +469,34 @@ fn build_planned_trade(
         amount_usd,
         max_slippage,
         pool_fee: cfg.trading.pool_fee_tier,
+    }
+}
+
+fn load_state() -> Option<PersistentState> {
+    let content = std::fs::read_to_string(STATE_FILE).ok()?;
+    let state: PersistentState = serde_json::from_str(&content).ok()?;
+    info!(
+        target: "vertexa",
+        daily_loss_cents = state.daily_loss_cents,
+        circuit_breaker = state.circuit_breaker_active,
+        position_cents = state.current_position_cents,
+        last_updated = %state.last_updated,
+        "loaded persistent state"
+    );
+    Some(state)
+}
+
+fn save_state(state: &PersistentState) {
+    match serde_json::to_string_pretty(state) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(STATE_FILE, &json) {
+                warn!(target: "vertexa", error = %e, "failed to save state");
+            } else {
+                info!(target: "vertexa", "state saved to {STATE_FILE}");
+            }
+        }
+        Err(e) => {
+            warn!(target: "vertexa", error = %e, "failed to serialize state");
+        }
     }
 }

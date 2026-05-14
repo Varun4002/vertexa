@@ -9,6 +9,7 @@ members = [
     "crates/risk",
     "crates/executor",
     "crates/notify",
+    "crates/rag_pipeline",
     "bin",
 ]
 

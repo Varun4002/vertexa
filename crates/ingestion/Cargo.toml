@@ -15,3 +15,4 @@ tokio-tungstenite.workspace = true
 reqwest.workspace = true
 eyre.workspace = true
 hex.workspace = true
+chrono.workspace = true

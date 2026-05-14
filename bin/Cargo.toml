@@ -7,6 +7,14 @@ version.workspace = true
 name = "vertexa"
 path = "vertexa.rs"
 
+[[bin]]
+name = "backtester"
+path = "backtester.rs"
+
+[[bin]]
+name = "backtest_historical"
+path = "backtest_historical.rs"
+
 [dependencies]
 vertexa-core = { path = "../crates/core" }
 vertexa-ingestion = { path = "../crates/ingestion" }
@@ -16,6 +24,7 @@ vertexa-mev-guard = { path = "../crates/mev_guard" }
 vertexa-risk = { path = "../crates/risk" }
 vertexa-executor = { path = "../crates/executor" }
 vertexa-notify = { path = "../crates/notify" }
+vertexa-rag = { path = "../crates/rag_pipeline" }
 alloy.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -27,3 +36,5 @@ eyre.workspace = true
 dotenvy.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
+csv = "1.3"
+clap = { version = "4", features = ["derive"] }

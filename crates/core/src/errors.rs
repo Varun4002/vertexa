@@ -46,6 +46,11 @@ pub enum VertexaError {
         reward_to_cost: f64,
         minimum: f64,
     },
+
+    #[error("simulation failed after {max_retries} retries")]
+    SimulationFailed {
+        max_retries: u8,
+    },
 }
 
 impl From<config::ConfigError> for VertexaError {

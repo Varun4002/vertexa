@@ -1,6 +1,6 @@
 # Vertexa
 
-Autonomous DEX trading bot for Arbitrum with volatility regime detection, MEV protection, gas-adjusted profitability gating, Discord notifications, and graceful shutdown with state persistence.
+Autonomous DEX trading bot for Arbitrum with real-time on-chain data ingestion, volatility regime detection, multi-signal consensus, MEV protection, gas-adjusted profitability gating, nonce-managed executor actor, event logging for backtesting, Discord notifications, and graceful shutdown with state persistence.
 
 ---
 
@@ -8,16 +8,19 @@ Autonomous DEX trading bot for Arbitrum with volatility regime detection, MEV pr
 
 Vertexa is a production-grade, modular trading bot that:
 
-1. **Ingests** on-chain market data (prices, volumes, orderbook, whale transactions)
-2. **Regime pre-filter** — ATR-based volatility classification (blocks ranging markets)
-3. **Computes** 4 technical signals + majority vote consensus
-4. **Assesses MEV threats** from mempool scanning and sandwich detection
-5. **Checks profitability** (expected edge vs gas + slippage + MEV loss)
-6. **Enforces risk limits** (position limits, daily loss circuit breaker)
-7. **Executes** via optimal route: public mempool, Flashbots bundle, or split execution
-8. **Notifies** via Discord webhook on trade attempts (success/failure/abort)
-9. **Persists state** to disk and restores on restart (daily loss, circuit breaker, position)
-10. **Shuts down gracefully** on SIGINT/SIGTERM — saves state before exit
+1. **Ingests** real-time on-chain data via Swap event subscription (replaces polling)
+2. **Decodes** mempool swap calldata to determine true whale buy/sell direction
+3. **Regime pre-filter** — ATR-based volatility classification (blocks ranging markets)
+4. **Computes** 4 technical signals + majority vote consensus
+5. **Assesses MEV threats** from mempool scanning and sandwich detection
+6. **Simulates** trades via `eth_call` before signing (pre-flight check)
+7. **Checks profitability** using real gas estimates (not hardcoded $0.10)
+8. **Enforces risk limits** (position limits, daily loss circuit breaker)
+9. **Executes** via a dedicated executor actor with nonce management and gas bump retry
+10. **Logs** every loop iteration to CSV for backtesting and strategy iteration
+11. **Notifies** via Discord webhook on trade attempts (success/failure/abort)
+12. **Persists state** to disk and restores on restart (daily loss, circuit breaker, position)
+13. **Shuts down gracefully** on SIGINT/SIGTERM — saves state before exit
 
 ---
 
@@ -52,14 +55,14 @@ Regime Classification:
 
 ### Profitability Gate
 
-Prevents execution when expected profit doesn't exceed total costs.
+Prevents execution when expected profit doesn't exceed total costs. Uses **real gas estimates** from the network rather than a hardcoded default.
 
 ```
 Inputs:
   - trade.amount_usd
   - decision.avg_confidence (0.0 to 1.0)
   - mev_assessment.estimated_mev_loss_usd
-  - gas_estimate_usd = $0.10 (Arbitrum default)
+  - gas_estimate_usd = real-time from GasEstimator (was $0.10 hardcoded)
 
 Calculation:
   edge_pct = 0.005 + (avg_confidence * 0.01)
@@ -75,7 +78,7 @@ Decision:
 
 ### MEV Protection
 
-Three execution routes based on threat assessment:
+Three execution routes based on threat assessment, with **pre-trade simulation** to verify output:
 
 | Route | When to Use |
 |-------|-------------|
@@ -83,6 +86,39 @@ Three execution routes based on threat assessment:
 | **Flashbots Bundle** | High MEV risk, needs frontrunning protection |
 | **Split Execution** | Large orders that can't be atomic |
 | **Abort** | MEV threat exceeds acceptable threshold |
+
+### Executor Actor
+
+Dedicated `tokio::sync::mpsc`-based actor that **owns the signer and nonce**:
+
+1. Receives `TradeIntent` (token, amount, direction, min output)
+2. Simulates via `eth_call` to verify output against current pool state
+3. Signs transaction with the next nonce
+4. Broadcasts and enters a `tokio::select!` loop:
+   - **Confirmation** → returns success
+   - **Timeout (5s)** → gas bump (+20%), re-signs with same nonce, retries up to 3x
+   - **Revert** → returns failure
+5. Sends `ExecutionResult` back via `oneshot` channel for logging and notification
+
+This eliminates nonce collisions and enables reliable gas bump retries.
+
+### Real-Time Price via Swap Events
+
+Replaces 12-second polling of `slot0()` with a WebSocket subscription to the pool's `Swap` event:
+
+- Parses `sqrtPriceX96` and `liquidity` from each event
+- Updates shared state atomically via `Arc<RwLock<f64>>`
+- Falls back to `slot0()` poll if no event received in 60s (missed event guard)
+- ~95% reduction in RPC usage vs polling
+
+### Mempool Whale Decoder
+
+Decodes `exactInputSingle` calldata from the Uniswap V3 router to determine true trade direction:
+
+- Parses `tokenIn`/`tokenOut` from pending transaction input
+- Classifies: buying ETH (USDC→WETH) or selling ETH (WETH→USDC)
+- Replaces heuristic `tx.to == USDC_ADDRESS` guess with actual decoded direction
+- Multi-hop swaps (`exactInput`) are skipped — too complex for reliable direction inference
 
 ### Notifications
 
@@ -99,6 +135,19 @@ Configure by adding a `[notify]` section to your config:
 discord_webhook_url = "https://discord.com/api/webhooks/..."
 ```
 
+### Event Logging & Backtesting
+
+Every loop iteration is logged to `data/events_YYYY-MM-DD.csv`:
+
+```
+timestamp,block,price,regime,action,confidence,size_mult,executed,route,tx_hash,error,gas_usd,mev_usd,edge_usd,reward_to_cost
+```
+
+The `backtester` binary replays this CSV to:
+- Compute PnL, win rate, Sharpe ratio, max drawdown
+- Re-run consensus with modified signal parameters ("what if" scenarios)
+- Validate strategy changes against historical data before going live
+
 ### Graceful Shutdown
 
 - Traps SIGINT (Ctrl+C) and SIGTERM
@@ -111,49 +160,64 @@ discord_webhook_url = "https://discord.com/api/webhooks/..."
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        bin/vertexa.rs                             │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    MAIN LOOP                              │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │  1. Build MarketContext                                  │   │
-│  │  2. ConsensusEngine::evaluate()                          │   │
-│  │     ├── Regime pre-gate (BLOCK if ranging)             │   │
-│  │     ├── Size multiplier (1.0x trending, 0.5x volatile)│   │
-│  │     ├── Signal evaluation & majority vote               │   │
-│  │     └── Confidence threshold gate                       │   │
-│  │  3. If Neutral → continue                               │   │
-│  │  4. Apply size_multiplier                               │   │
-│  │  5. Build PlannedTrade                                  │   │
-│  │  6. MEV assessment (mev_guard)                         │   │
-│  │  7. PROFITABILITY CHECK (uses MEV estimate)            │   │
-│  │  8. Existing risk checks                                │   │
-│  │  9. Notify (Discord webhook)                            │   │
-│  │  10. Execute via recommended route                       │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                        MAIN LOOP (vertexa.rs)                        │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │  1. Build MarketContext (from SharedState)                 │   │
+│  │  2. ConsensusEngine::evaluate()                            │   │
+│  │     ├── Regime pre-gate (BLOCK if ranging)               │   │
+│  │     ├── Size multiplier (1.0x trending, 0.5x volatile)   │   │
+│  │     ├── Signal evaluation & majority vote                 │   │
+│  │     └── Confidence threshold gate                         │   │
+│  │  3. If Neutral → continue                                 │   │
+│  │  4. Apply size_multiplier → adjusted_usd                  │   │
+│  │  5. Build TradeIntent                                     │   │
+│  │  6. MEV assessment (mev_guard)                           │   │
+│  │  7. Gas estimate (real-time from GasEstimator)           │   │
+│  │  8. PROFITABILITY CHECK (uses real gas + MEV estimate)   │   │
+│  │  9. Risk checks (limits, circuit breaker)                │   │
+│  │  10. Send TradeIntent ──mpsc──► ExecutorActor            │   │
+│  │  11. Log to CSV (EventLogger)                            │   │
+│  │  12. Notify (Discord webhook)                            │   │
+│  └────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────┘
 
-                         CRATE LAYOUT:
+                          EXECUTOR ACTOR (spawned task)
+┌────────────────────────────────────────────────────────────────────┐
+│  mpsc::Receiver<TradeIntent>                                       │
+│       │                                                             │
+│   1. Simulate via eth_call (pre-flight check)                      │
+│   2. Sign tx with next nonce                                       │
+│   3. Broadcast                                                     │
+│   4. tokio::select! loop:                                          │
+│        ├ Confirmed   ──→ oneshot::Sender──► log + notify           │
+│        ├ Timeout(5s) ──→ gas bump +20%, re-sign, retry (3x max)   │
+│        └ Reverted    ──→ oneshot::Sender──► log + abort            │
+└────────────────────────────────────────────────────────────────────┘
 
-┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐
-│  core    │  │ signals  │  │ consensus │  │ ingestion │  │  notify   │
-├──────────┤  ├──────────┤  ├───────────┤  ├───────────┤  ├───────────┤
-│ types    │  │ rsi      │  │ engine    │  │price_feed │  │ notifier  │
-│ signal   │  │ ema      │  │           │  │pool_reader│  │           │
-│ errors   │  │ orderbook│  │           │  │context_bld│  │           │
-│          │  │onchain_flow│ │           │  │           │  │           │
-│          │  │volatility_  │ │           │  │           │  │           │
-│          │  │  regime    │ │           │  │           │  │           │
-└──────────┘  └──────────┘  └───────────┘  └───────────┘  └───────────┘
-
-┌──────────┐  ┌──────────┐  ┌───────────┐
-│mev_guard │  │  risk    │  │ executor  │
-├──────────┤  ├──────────┤  ├───────────┤
-│ detector │  │ checker  │  │swap_builder│
-│ flashbots│  │profitability││  signer   │
-│split_exec│  │          │  │broadcaster│
-│  guard   │  │          │  │           │
-└──────────┘  └──────────┘  └───────────┘
+                         DATA FLOW:
+┌─────────────┐  Swap events   ┌──────────────┐        ┌──────────────┐
+│ Pool Events ├───────────────►│ SharedState   │        │  Mempool     │
+│ (spawned)   │                │ (Arc<RwLock>) │        │  Monitor     │
+└─────────────┘                │              │        │  (spawned)   │
+                               │ price_series │        └──────┬───────┘
+┌─────────────┐                │ pool_price   │               │
+│ Pool Reader ├───────────────►│ liquidity    │       Decoded calldata
+│ (fallback)  │                │ block_number │               │
+└─────────────┘                │ pending_txs  │◄──────────────┘
+                               └──────────────┘
+                                      │
+                                      ▼
+                               ┌──────────────┐
+                               │ ContextBuilder│
+                               │ .build()      │
+                               └──────┬───────┘
+                                      │ MarketContext
+                                      ▼
+                               ┌──────────────┐
+                               │   Consensus   │
+                               │   Engine      │
+                               └──────────────┘
 ```
 
 ---
@@ -252,7 +316,7 @@ cargo check --workspace
 # Run lints
 cargo clippy --workspace -- -D warnings
 
-# Run tests (36 total)
+# Run tests
 cargo test --workspace
 ```
 
@@ -263,10 +327,11 @@ cargo test --workspace
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    1. MARKET CONTEXT                          │
-│  ├── Price feed (latest prices & volumes)                    │
-│  ├── Pool reader (current price, liquidity)                  │
-│  ├── Orderbook (simulated from on-chain data)               │
-│  ├── Recent whale transactions                               │
+│  ├── Price feed (Binance WS, 1m klines)                     │
+│  ├── Pool events (Swap event subscription, real-time)        │
+│  ├── Pool reader (slot0() fallback poll every 12s)           │
+│  ├── Orderbook (simulated from on-chain liquidity)           │
+│  ├── Recent whale transactions (calldata-decoded direction)  │
 │  └── Block number + timestamp                                 │
 └──────────────────────────────────────────────────────────────┘
                               ↓
@@ -299,6 +364,7 @@ cargo test --workspace
 ┌──────────────────────────────────────────────────────────────┐
 │                    5. MEV ASSESSMENT                          │
 │  ├── Mempool scan for known bot addresses                    │
+│  ├── Decode swap calldata for whale direction                │
 │  ├── Sandwich probability calculation                        │
 │  ├── Estimated MEV loss (USD)                                │
 │  └── Recommended route: Public / Flashbots / Split / Abort  │
@@ -306,8 +372,9 @@ cargo test --workspace
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
 │                    6. PROFITABILITY GATE                      │
+│  ├── Real gas estimate (from GasEstimator)                   │
 │  ├── Expected edge: confidence → % move                      │
-│  ├── Costs: gas ($0.10) + slippage + MEV loss              │
+│  ├── Costs: gas (real) + slippage + MEV loss                │
 │  ├── reward_to_cost = expected_edge / total_cost             │
 │  └── IF ratio < 1.5 → ABORT (not profitable)                │
 └──────────────────────────────────────────────────────────────┘
@@ -321,17 +388,21 @@ cargo test --workspace
 └──────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
-│                    8. NOTIFY                                  │
-│  ├── Discord webhook embed — success, failure, or abort      │
-│  └── Includes action, amount, route, risk score, tx hash     │
+│                    8. EXECUTE via ACTOR                       │
+│  ├── Send TradeIntent to ExecutorActor via mpsc              │
+│  ├── Actor simulates via eth_call (pre-flight check)        │
+│  ├── Actor signs with next nonce                             │
+│  ├── Actor broadcasts (public mempool)                       │
+│  ├── Actor monitors for confirmation / timeout / revert     │
+│  ├── On timeout: gas bump +20%, re-sign, retry (up to 3x)   │
+│  └── ExecutionResult sent back via oneshot                   │
 └──────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
-│                    9. EXECUTION                                │
-│  ├── Build Uniswap V3 swap calldata                          │
-│  ├── Sign transaction with private key                        │
-│  ├── Broadcast via recommended route                          │
-│  └── Record trade for position tracking                       │
+│                    9. LOG & NOTIFY                            │
+│  ├── CSV event logger (every iteration, data/events_*.csv)   │
+│  ├── Discord webhook embed — success, failure, or abort      │
+│  └── Record trade for position tracking                      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -345,11 +416,14 @@ State persistence and graceful shutdown wrap the entire loop — state is saved 
 |-----------|------------|
 | Runtime | Tokio (async) |
 | Web3 | Alloy |
+| Actor Communication | `tokio::sync::mpsc`, `oneshot` |
 | Error Handling | `eyre` (app), `thiserror` (libraries) |
 | Config | `config-rs` + `dotenvy` |
-| Logging | `tracing` (JSON output) |
+| Logging | `tracing` (JSON output), CSV event files |
 | Notifications | Discord webhooks via `reqwest` |
+| Backtesting | Replay binary (`backtester`) |
 | Target Chain | Arbitrum (Chain ID 42161) |
+| Target DEX | Uniswap V3 (WETH/USDC 0.05%) |
 
 ---
 
@@ -361,18 +435,20 @@ Vertexa/
 ├── Cargo.toml          # Workspace manifest
 ├── README.md           # This file
 ├── vertexa_state.json  # Persisted state (auto-generated)
+├── data/               # Event CSV logs (auto-generated)
 ├── bin/
-│   └── vertexa.rs      # Main entrypoint & loop
+│   ├── vertexa.rs      # Main entrypoint & loop
+│   └── backtester.rs   # CSV replay / backtesting binary
 ├── config/
 │   └── default.toml    # Configuration
 └── crates/
     ├── core/           # Shared types, traits, errors
     ├── consensus/      # Voting & regime pre-gate
     ├── signals/        # RSI, EMA, OrderBook, OnchainFlow, VolatilityRegime
-    ├── ingestion/      # Data collection
-    ├── mev_guard/      # MEV detection & routing
+    ├── ingestion/      # Data collection (pool_events, gas_estimator, event_logger)
+    ├── mev_guard/      # MEV detection & routing (swap calldata decoder)
     ├── risk/           # Risk checks + profitability gate
-    ├── executor/       # Swap building & broadcasting
+    ├── executor/       # Swap building, simulator, executor actor, signer
     └── notify/         # Discord webhook notifications
 ```
 
@@ -384,7 +460,8 @@ Vertexa/
 2. **Start with small position sizes**
 3. **Set conservative daily loss limits**
 4. **Monitor logs and Discord notifications continuously**
-5. **Understand that past performance ≠ future results**
+5. **Run the backtester before changing any signal parameters**
+6. **Understand that past performance ≠ future results**
 
 ---
 

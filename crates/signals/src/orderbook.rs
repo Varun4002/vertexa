@@ -58,11 +58,13 @@ mod tests {
                 bids: vec![PriceLevel { price: 2990.0, size: bid_size }; 10],
                 asks: vec![PriceLevel { price: 3010.0, size: ask_size }; 10],
             },
+            tick_liquidity: None,
             recent_whale_txs: vec![],
             pool_liquidity: 10_000_000.0,
             current_price: 3000.0,
             block_number: 0,
             timestamp: Instant::now(),
+            macro_regime: None,
         }
     }
 

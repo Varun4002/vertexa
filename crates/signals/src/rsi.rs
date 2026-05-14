@@ -95,11 +95,13 @@ mod tests {
             prices,
             volumes: vec![],
             orderbook: OrderBook { bids: vec![], asks: vec![] },
+            tick_liquidity: None,
             recent_whale_txs: vec![],
             pool_liquidity: 10_000_000.0,
             current_price,
             block_number: 0,
             timestamp: Instant::now(),
+            macro_regime: None,
         }
     }
 

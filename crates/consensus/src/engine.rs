@@ -26,35 +26,48 @@ impl ConsensusEngine {
     }
 
     pub async fn evaluate(&self, ctx: &MarketContext) -> Decision {
-        let regime = match VolatilityRegimeSignal::classify(&ctx.prices, 14) {
+        let regime = match self.regime_signal.classify(&ctx.prices) {
             Some(r) => r,
             None => Regime::Ranging,
         };
 
-        if regime == Regime::Ranging {
+        let mut size_multiplier = match regime {
+            Regime::Trending => 1.0,
+            Regime::Volatile => 0.5,
+            Regime::Ranging => 0.0,
+        };
+
+        let mut confidence_modifier = 1.0;
+
+        if let Some(macro_regime) = &ctx.macro_regime {
             info!(
                 target: "vertexa",
-                regime = "ranging",
-                "Pre-gate blocked — market ranging"
+                macro_regime = macro_regime.name,
+                match_score = macro_regime.match_score,
+                "Applying macro regime modifiers"
+            );
+            if let Some(m_size) = macro_regime.size_multiplier_override {
+                size_multiplier = m_size;
+            }
+            confidence_modifier = macro_regime.confidence_modifier;
+        }
+
+        if size_multiplier <= 0.0 {
+            info!(
+                target: "vertexa",
+                regime = ?regime,
+                macro = ?ctx.macro_regime.as_ref().map(|m| &m.name),
+                "Pre-gate blocked — market ranging or macro-blocked"
             );
             return Decision {
                 action: Vote::Neutral,
                 agreeing_signals: vec![],
                 avg_confidence: 0.0,
                 dissenting_signals: vec![],
-                blocked_by: Some("VolatilityRegime::Ranging"),
+                blocked_by: Some("RegimeGate"),
                 size_multiplier: 0.0,
             };
         }
-
-        let size_multiplier = match regime {
-            Regime::Trending => 1.0,
-            Regime::Volatile => 0.5,
-            Regime::Ranging => {
-                info!(target: "vertexa", "Ranging regime unexpectedly reached size_multiplier — defaulting to 0.0");
-                0.0
-            }
-        };
 
         let futures = self.signals.iter().map(|s| s.evaluate(ctx));
         let results = join_all(futures).await;
@@ -104,7 +117,7 @@ impl ConsensusEngine {
         let avg_confidence = if agreeing.is_empty() {
             0.0
         } else {
-            agreeing.iter().map(|r| r.confidence).sum::<f64>() / agreeing.len() as f64
+            (agreeing.iter().map(|r| r.confidence).sum::<f64>() / agreeing.len() as f64) * confidence_modifier
         };
 
         let dissenting_signals: Vec<String> = results
@@ -239,11 +252,13 @@ mod tests {
             prices,
             volumes: vec![],
             orderbook: OrderBook { bids: vec![], asks: vec![] },
+            tick_liquidity: None,
             recent_whale_txs: vec![],
             pool_liquidity: 10_000_000.0,
             current_price,
             block_number: 0,
             timestamp: Instant::now(),
+            macro_regime: None,
         };
 
         let signals: Vec<Box<dyn Signal>> = vec![
@@ -255,7 +270,7 @@ mod tests {
         let engine = ConsensusEngine::new(signals, 3, 0.35);
         let decision = engine.evaluate(&ctx).await;
         assert_eq!(decision.action, Vote::Neutral);
-        assert_eq!(decision.blocked_by, Some("VolatilityRegime::Ranging"));
+        assert_eq!(decision.blocked_by, Some("RegimeGate"));
         assert_eq!(decision.size_multiplier, 0.0);
     }
 

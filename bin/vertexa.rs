@@ -1,23 +1,25 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::signal;
 use tracing::{info, warn, error};
 use tracing_subscriber::EnvFilter;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 
 use vertexa_core::{
-    Decision, MarketContext, PlannedTrade, PriceSeries,
+    Decision, ExecutionResult, MarketContext, PlannedTrade, PriceSeries,
     Signal, Vote, ExecutionRoute, FixedUsd,
 };
-use vertexa_ingestion::{price_feed, pool_reader, context_builder::ContextBuilder};
+use vertexa_ingestion::{price_feed, pool_reader, pool_events, gas_estimator, event_logger,
+    context_builder::ContextBuilder};
 use vertexa_signals::{RsiSignal, EmaCrossoverSignal, OrderBookSignal, OnchainFlowSignal};
 use vertexa_consensus::ConsensusEngine;
 use vertexa_mev_guard::{MempoolMonitor, FlashbotsRelay, SplitExecutor, MevGuard};
 use vertexa_risk::{RiskChecker, RiskConfig};
-use vertexa_executor::{SwapBuilder, TxSigner, Broadcaster};
+use vertexa_executor::{SwapBuilder, TxSigner, Broadcaster, Simulator, ExecutorActor, ExecCommand};
 use vertexa_notify::{Notifier, TradeNotification};
+use vertexa_rag::RagClient;
 
 const STATE_FILE: &str = "vertexa_state.json";
 
@@ -37,6 +39,7 @@ struct AppConfig {
     mev: MevConfig,
     consensus: ConsensusConfig,
     notify: Option<NotifyConfig>,
+    reputation: Option<std::collections::HashMap<String, f64>>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -53,6 +56,7 @@ struct TradingConfig {
     pool_address: String,
     pool_fee_tier: u32,
     max_trade_usd: f64,
+    min_trade_usd: f64,
     max_position_usd: f64,
     loop_interval_s: u64,
 }
@@ -139,7 +143,10 @@ async fn main() -> eyre::Result<()> {
     let price_series = Arc::new(RwLock::new(PriceSeries::new(100)));
     let pool_price = Arc::new(RwLock::new(0.0_f64));
     let pool_liquidity = Arc::new(RwLock::new(0.0_f64));
+    let tick_liquidity = Arc::new(RwLock::new(vertexa_core::TickLiquidity::default()));
     let block_number = Arc::new(RwLock::new(0u64));
+    let macro_regime = Arc::new(RwLock::new(None));
+    let pool_reset_signal = Arc::new(tokio::sync::Notify::new());
 
     price_feed::start(price_series.clone()).await;
 
@@ -148,6 +155,16 @@ async fn main() -> eyre::Result<()> {
         pool_liquidity.clone(),
         block_number.clone(),
         &app_cfg.network.rpc_http,
+        pool_reset_signal.clone(),
+    ).await;
+
+    pool_events::start(
+        pool_price.clone(),
+        pool_liquidity.clone(),
+        tick_liquidity.clone(),
+        pool_address,
+        &rpc_ws,
+        pool_reset_signal.clone(),
     ).await;
 
     let mempool_monitor = MempoolMonitor::new(&app_cfg.mev.known_bot_addresses);
@@ -157,17 +174,46 @@ async fn main() -> eyre::Result<()> {
 
     let context_builder = ContextBuilder::new(
         price_series,
-        pool_price,
-        pool_liquidity,
+        pool_price.clone(),
+        pool_liquidity.clone(),
+        tick_liquidity.clone(),
         pending_txs.clone(),
-        block_number,
+        block_number.clone(),
+        macro_regime.clone(),
     );
+
+    // RAG Pipeline Task
+    let rag_client = RagClient::new(
+        "http://localhost:6333", // Default Qdrant URL
+        "market_regimes",
+        "https://api.news.com",
+    ).expect("failed to init RAG client");
+
+    let macro_regime_clone = macro_regime.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 mins
+        loop {
+            interval.tick().await;
+            if let Err(e) = rag_client.update_macro_regime(macro_regime_clone.clone()).await {
+                error!(target: "vertexa", error = %e, "RAG update failed");
+            }
+        }
+    });
+
+    let mut reputation_weights = std::collections::HashMap::new();
+    if let Some(rep) = &app_cfg.reputation {
+        for (addr_str, weight) in rep {
+            if let Ok(addr) = addr_str.parse::<Address>() {
+                reputation_weights.insert(addr, *weight);
+            }
+        }
+    }
 
     let signals: Vec<Box<dyn Signal>> = vec![
         Box::new(RsiSignal::new()),
         Box::new(EmaCrossoverSignal::new()),
         Box::new(OrderBookSignal::new()),
-        Box::new(OnchainFlowSignal::new()),
+        Box::new(OnchainFlowSignal::new(reputation_weights)),
     ];
 
     let engine = ConsensusEngine::new(
@@ -216,7 +262,31 @@ async fn main() -> eyre::Result<()> {
         split_executor,
     );
 
+    let gas_estimator = gas_estimator::GasEstimator::new(
+        &app_cfg.network.rpc_http,
+        pool_price.clone(),
+    );
+
+    let event_log = event_logger::EventLogger::new(
+        std::path::PathBuf::from("data"),
+    ).await;
+
+    let simulator = Simulator::new(
+        &app_cfg.network.rpc_http,
+        Some(app_cfg.mev.flashbots_relay_url.clone()),
+    );
+
+    let (actor_tx, actor_rx) = mpsc::channel::<ExecCommand>(16);
+    ExecutorActor::spawn(
+        actor_rx,
+        &app_cfg.network.rpc_http,
+        signer.clone_signer(),
+        is_paper,
+    );
+
     let loop_interval = Duration::from_secs(app_cfg.trading.loop_interval_s);
+
+    let use_actor: bool = true;
 
     info!(
         target: "vertexa",
@@ -269,11 +339,15 @@ async fn main() -> eyre::Result<()> {
                     &risk_checker,
                     &swap_builder,
                     &broadcaster,
-                    &signer,
                     &notifier,
                     &app_cfg,
                     pool_address,
                     is_paper,
+                    &gas_estimator,
+                    &event_log,
+                    &simulator,
+                    &actor_tx,
+                    use_actor,
                 ).await;
             }
         }
@@ -290,11 +364,15 @@ async fn run_loop_iteration(
     risk_checker: &RiskChecker,
     swap_builder: &SwapBuilder,
     broadcaster: &Broadcaster,
-    signer: &TxSigner,
     notifier: &Notifier,
     cfg: &AppConfig,
     pool_address: Address,
     is_paper: bool,
+    gas_estimator: &gas_estimator::GasEstimator,
+    event_log: &event_logger::EventLogger,
+    simulator: &Simulator,
+    actor_tx: &mpsc::Sender<ExecCommand>,
+    use_actor: bool,
 ) {
     let ctx = match context_builder.build(&cfg.trading.pair, pool_address).await {
         Ok(ctx) => ctx,
@@ -306,14 +384,45 @@ async fn run_loop_iteration(
 
     let decision = engine.evaluate(&ctx).await;
 
+    let log_regime = if let Some(blocked_by) = decision.blocked_by {
+        if blocked_by.contains("Ranging") {
+            "Ranging"
+        } else {
+            "Blocked"
+        }
+    } else if decision.size_multiplier >= 1.0 {
+        "Trending"
+    } else {
+        "Volatile"
+    };
+
     if decision.action == Vote::Neutral {
+        event_log.log(
+            ctx.block_number, ctx.current_price, log_regime,
+            &decision.action, decision.avg_confidence, decision.size_multiplier,
+            false, "", &None, &None,
+            FixedUsd::from_dollars(0.0), FixedUsd::from_dollars(0.0),
+            FixedUsd::from_dollars(0.0), 0.0,
+        ).await;
         return;
     }
 
     let adjusted_usd = cfg.trading.max_trade_usd * decision.size_multiplier;
 
-    if adjusted_usd < 10.0 {
-        warn!(target: "vertexa", "adjusted trade size too small, skipping");
+    if adjusted_usd < cfg.trading.min_trade_usd {
+        warn!(
+            target: "vertexa",
+            adjusted_usd,
+            min_trade_usd = cfg.trading.min_trade_usd,
+            "adjusted trade size too small, skipping"
+        );
+        event_log.log(
+            ctx.block_number, ctx.current_price, log_regime,
+            &decision.action, decision.avg_confidence, decision.size_multiplier,
+            false, "TooSmall", &None, &Some(format!("adjusted size ${:.2} under minimum ${:.2}", adjusted_usd, cfg.trading.min_trade_usd)),
+            FixedUsd::from_dollars(0.0), FixedUsd::from_dollars(0.0),
+            FixedUsd::from_dollars(0.0), 0.0,
+        ).await;
         return;
     }
 
@@ -336,41 +445,111 @@ async fn run_loop_iteration(
             tx_hash: None,
             success: false,
             error: Some(format!("MEV guard aborted (risk {:.2})", assessment.risk_score)),
-            regime: None,
+            regime: Some(log_regime.into()),
             block_number: Some(ctx.block_number),
         });
+        event_log.log(
+            ctx.block_number, ctx.current_price, log_regime,
+            &decision.action, decision.avg_confidence, decision.size_multiplier,
+            false, "MEVAbort", &None, &Some("MEV guard aborted".into()),
+            FixedUsd::from_dollars(0.0), FixedUsd::from_dollars(assessment.estimated_mev_loss_usd),
+            FixedUsd::from_dollars(0.0), 0.0,
+        ).await;
         return;
     }
 
-    if let Err(e) = risk_checker.check_profitability(
+    let tx = match swap_builder.build_tx(&trade, &cfg.network.rpc_http).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(target: "vertexa", error = %e, "failed to build swap tx");
+            event_log.log(
+                ctx.block_number, ctx.current_price, log_regime,
+                &decision.action, decision.avg_confidence, decision.size_multiplier,
+                false, "BuildError", &None, &Some(e.clone()),
+                FixedUsd::from_dollars(0.0), FixedUsd::from_dollars(0.0),
+                FixedUsd::from_dollars(0.0), 0.0,
+            ).await;
+            return;
+        }
+    };
+
+    let sim_result = match simulator.simulate(&tx).await {
+        Ok(res) => res,
+        Err(e) => {
+            warn!(target: "vertexa", error = %e, "simulation failed — aborting trade");
+            notifier.notify(&TradeNotification {
+                action: decision.action.clone(),
+                amount: FixedUsd::from_dollars(adjusted_usd),
+                route: "SimulationGate".into(),
+                risk_score: assessment.risk_score,
+                sandwich_probability: assessment.sandwich_probability,
+                tx_hash: None,
+                success: false,
+                error: Some(e.clone()),
+                regime: Some(log_regime.into()),
+                block_number: Some(ctx.block_number),
+            });
+            event_log.log(
+                ctx.block_number, ctx.current_price, log_regime,
+                &decision.action, decision.avg_confidence, decision.size_multiplier,
+                false, "SimulationGate", &None, &Some(e),
+                FixedUsd::from_dollars(0.0), FixedUsd::from_dollars(0.0),
+                FixedUsd::from_dollars(0.0), 0.0,
+            ).await;
+            return;
+        }
+    };
+
+    let gas_cost = FixedUsd::from_dollars(sim_result.gas_used as f64 * ctx.current_price / 1e18);
+    let mev_cost = FixedUsd::from_dollars(assessment.estimated_mev_loss_usd);
+
+    let cost_breakdown = match risk_checker.check_profitability(
         &trade,
         decision.avg_confidence,
-        FixedUsd::from_dollars(assessment.estimated_mev_loss_usd),
+        mev_cost,
+        gas_cost,
+        Some(sim_result.confidence),
     ) {
-        warn!(
-            target: "vertexa",
-            error = %e,
-            "profitability check failed — skipping trade"
-        );
-        notifier.notify(&TradeNotification {
-            action: decision.action.clone(),
-            amount: FixedUsd::from_dollars(adjusted_usd),
-            route: "ProfitabilityGate".into(),
-            risk_score: assessment.risk_score,
-            sandwich_probability: assessment.sandwich_probability,
-            tx_hash: None,
-            success: false,
-            error: Some(e.to_string()),
-            regime: None,
-            block_number: Some(ctx.block_number),
-        });
-        return;
-    }
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                target: "vertexa",
+                error = %e,
+                "profitability check failed — skipping trade"
+            );
+            notifier.notify(&TradeNotification {
+                action: decision.action.clone(),
+                amount: FixedUsd::from_dollars(adjusted_usd),
+                route: "ProfitabilityGate".into(),
+                risk_score: assessment.risk_score,
+                sandwich_probability: assessment.sandwich_probability,
+                tx_hash: None,
+                success: false,
+                error: Some(e.to_string()),
+                regime: Some(log_regime.into()),
+                block_number: Some(ctx.block_number),
+            });
+            let edge_pct = 0.005 + (decision.avg_confidence * 0.01);
+            let expected_edge = FixedUsd::from_dollars(trade.amount_usd * edge_pct);
+            let slippage_cost = FixedUsd::from_dollars(trade.amount_usd * trade.max_slippage);
+            let total = gas_cost + slippage_cost + mev_cost;
+            let ratio = if total.to_dollars() <= 0.0 { 0.0 } else { expected_edge.to_dollars() / total.to_dollars() };
+            event_log.log(
+                ctx.block_number, ctx.current_price, log_regime,
+                &decision.action, decision.avg_confidence, decision.size_multiplier,
+                false, "ProfitabilityGate", &None, &Some(e.to_string()),
+                gas_cost, mev_cost,
+                expected_edge, ratio,
+            ).await;
+            return;
+        }
+    };
 
-    if let Err(e) = risk_checker.check(&trade, &assessment) {
+    if let Err(err) = risk_checker.check(&trade, &assessment, ctx.macro_regime.as_ref()) {
+        let err_str = err;
         warn!(
             target: "vertexa",
-            error = %e,
+            error = %err_str,
             "risk check failed — skipping trade"
         );
         notifier.notify(&TradeNotification {
@@ -381,63 +560,162 @@ async fn run_loop_iteration(
             sandwich_probability: assessment.sandwich_probability,
             tx_hash: None,
             success: false,
-            error: Some(e),
-            regime: None,
+            error: Some(err_str.clone()),
+            regime: Some(log_regime.into()),
             block_number: Some(ctx.block_number),
         });
+        event_log.log(
+            ctx.block_number, ctx.current_price, log_regime,
+            &decision.action, decision.avg_confidence, decision.size_multiplier,
+            false, "RiskGate", &None, &Some(err_str),
+            gas_cost, mev_cost,
+            cost_breakdown.expected_edge_usd,
+            cost_breakdown.reward_to_cost,
+        ).await;
         return;
     }
 
-    let tx = match swap_builder.build_tx(&trade, &cfg.network.rpc_http).await {
-        Ok(tx) => tx,
-        Err(e) => {
-            warn!(target: "vertexa", error = %e, "failed to build swap tx");
-            return;
+    info!(target: "vertexa", amount_out = %sim_result.amount_out, confidence = ?sim_result.confidence, "simulation passed");
+
+    let route_str = format!("{:?}", assessment.recommended_route);
+
+    // Item 8: ExecutorActor Fee Cap calculation
+    // max_gas_price = (expected_edge_usd - total_other_costs) / gas_units * eth_price
+    let slippage_cost_usd = trade.amount_usd * trade.max_slippage;
+    let other_costs_usd = slippage_cost_usd + mev_cost.to_dollars();
+    let edge_usd = cost_breakdown.expected_edge_usd.to_dollars();
+    
+    let max_gas_budget_usd = edge_usd - other_costs_usd;
+    let max_gas_price_wei = if max_gas_budget_usd > 0.0 {
+        Some((max_gas_budget_usd * 1e18 / (sim_result.gas_used as f64 * ctx.current_price)) as u128)
+    } else {
+        None
+    };
+
+    let (executed, result) = if assessment.recommended_route == ExecutionRoute::PublicMempool && use_actor {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        match actor_tx.send((trade.clone(), tx.clone(), resp_tx, max_gas_price_wei)).await {
+            Ok(()) => {
+                match resp_rx.await {
+                    Ok(res) => (res.success, res),
+                    Err(e) => {
+                        let res = ExecutionResult {
+                            success: false,
+                            tx_hash: None,
+                            gas_used: None,
+                            actual_amount_out: None,
+                            error: Some(format!("oneshot cancelled: {e}")),
+                        };
+                        (false, res)
+                    }
+                }
+            }
+            Err(e) => {
+                let res = ExecutionResult {
+                    success: false,
+                    tx_hash: None,
+                    gas_used: None,
+                    actual_amount_out: None,
+                    error: Some(format!("actor send failed: {e}")),
+                };
+                (false, res)
+            }
+        }
+    } else {
+        match broadcaster.broadcast(&tx, &TxSigner::from_env().unwrap(), &trade, &assessment, is_paper).await {
+            Ok(hash) => {
+                let res = ExecutionResult {
+                    success: true,
+                    tx_hash: hash.parse::<B256>().ok(),
+                    gas_used: None,
+                    actual_amount_out: None, // Broadcaster doesn't fetch receipts yet
+                    error: None,
+                };
+                (true, res)
+            },
+            Err(e) => {
+                let res = ExecutionResult {
+                    success: false,
+                    tx_hash: None,
+                    gas_used: None,
+                    actual_amount_out: None,
+                    error: Some(e),
+                };
+                (false, res)
+            },
         }
     };
 
-    match broadcaster.broadcast(&tx, signer, &trade, &assessment, is_paper).await {
-        Ok(tx_hash) => {
-            info!(
-                target: "vertexa",
-                tx_hash = %tx_hash,
-                action = ?decision.action,
-                amount_usd = trade.amount_usd,
-                route = ?assessment.recommended_route,
-                "trade executed"
-            );
-            risk_checker.record_trade(trade.amount_usd, 0.0);
+    if executed {
+        info!(
+            target: "vertexa",
+            tx_hash = ?result.tx_hash,
+            action = ?decision.action,
+            amount_usd = trade.amount_usd,
+            route = ?assessment.recommended_route,
+            "trade executed"
+        );
 
-            let notif = TradeNotification {
-                action: decision.action.clone(),
-                amount: FixedUsd::from_dollars(adjusted_usd),
-                route: format!("{:?}", assessment.recommended_route),
-                risk_score: assessment.risk_score,
-                sandwich_probability: assessment.sandwich_probability,
-                tx_hash: Some(tx_hash),
-                success: true,
-                error: None,
-                regime: None,
-                block_number: Some(ctx.block_number),
-            };
-            notifier.notify(&notif);
-        }
-        Err(e) => {
-            error!(target: "vertexa", error = %e, "trade execution failed");
+        // Item 7: Post-Execution Slippage Kill-Switch
+        if let Err(err) = risk_checker.check_slippage(&trade, &result) {
+            error!(target: "vertexa", error = %err, "slippage check failed after execution");
             notifier.notify(&TradeNotification {
                 action: decision.action.clone(),
                 amount: FixedUsd::from_dollars(adjusted_usd),
-                route: format!("{:?}", assessment.recommended_route),
+                route: "SlippageGate".into(),
                 risk_score: assessment.risk_score,
                 sandwich_probability: assessment.sandwich_probability,
-                tx_hash: None,
+                tx_hash: result.tx_hash.as_ref().map(|h| format!("{:#x}", h)),
                 success: false,
-                error: Some(e),
-                regime: None,
+                error: Some(err),
+                regime: Some(log_regime.into()),
                 block_number: Some(ctx.block_number),
             });
+            // We still record the trade size for position tracking, but PnL might be hit
+            risk_checker.record_trade(trade.amount_usd, 0.0);
+            return;
         }
+
+        risk_checker.record_trade(trade.amount_usd, 0.0);
+
+        let notif = TradeNotification {
+            action: decision.action.clone(),
+            amount: FixedUsd::from_dollars(adjusted_usd),
+            route: route_str.clone(),
+            risk_score: assessment.risk_score,
+            sandwich_probability: assessment.sandwich_probability,
+            tx_hash: result.tx_hash.as_ref().map(|h| format!("{:#x}", h)),
+            success: true,
+            error: None,
+            regime: Some(log_regime.into()),
+            block_number: Some(ctx.block_number),
+        };
+        notifier.notify(&notif);
+    } else {
+        let err_msg = result.error.clone().unwrap_or_default();
+        error!(target: "vertexa", error = %err_msg, "trade execution failed");
+        notifier.notify(&TradeNotification {
+            action: decision.action.clone(),
+            amount: FixedUsd::from_dollars(adjusted_usd),
+            route: route_str.clone(),
+            risk_score: assessment.risk_score,
+            sandwich_probability: assessment.sandwich_probability,
+            tx_hash: None,
+            success: false,
+            error: result.error.clone(),
+            regime: Some(log_regime.into()),
+            block_number: Some(ctx.block_number),
+        });
     }
+
+    event_log.log(
+        ctx.block_number, ctx.current_price, log_regime,
+        &decision.action, decision.avg_confidence, decision.size_multiplier,
+        executed, &route_str, &result.tx_hash.as_ref().map(|h| format!("{:#x}", h)), &result.error,
+        gas_cost, mev_cost,
+        cost_breakdown.expected_edge_usd,
+        cost_breakdown.reward_to_cost,
+    ).await;
 }
 
 fn build_planned_trade(
@@ -461,11 +739,21 @@ fn build_planned_trade(
         Vote::Neutral => (vertexa_core::USDC_ADDRESS, vertexa_core::WETH_ADDRESS),
     };
 
+    let expected_out_usd = amount_usd * (1.0 - max_slippage);
+    let expected_min_amount_out = if decision.action == Vote::Buy {
+        // We get WETH (18 decimals)
+        alloy::primitives::U256::from((expected_out_usd * 1e18 / ctx.current_price) as u128)
+    } else {
+        // We get USDC (6 decimals)
+        alloy::primitives::U256::from((expected_out_usd * 1e6) as u128)
+    };
+
     PlannedTrade {
         action: decision.action.clone(),
         token_in,
         token_out,
         amount_in: alloy::primitives::U256::from(amount_in_wei),
+        expected_min_amount_out,
         amount_usd,
         max_slippage,
         pool_fee: cfg.trading.pool_fee_tier,

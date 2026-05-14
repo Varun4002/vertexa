@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use vertexa_core::{
     MarketContext, PriceSeries, WhaleTx, PendingTx,
-    USDC_ADDRESS,
+    Vote, MacroRegime, TickLiquidity,
 };
 use tracing::warn;
 
@@ -15,8 +15,10 @@ pub struct ContextBuilder {
     price_series: Arc<RwLock<PriceSeries>>,
     pool_price: Arc<RwLock<f64>>,
     pool_liquidity: Arc<RwLock<f64>>,
+    tick_liquidity: Arc<RwLock<TickLiquidity>>,
     pending_txs: Arc<RwLock<VecDeque<PendingTx>>>,
     block_number: Arc<RwLock<u64>>,
+    macro_regime: Arc<RwLock<Option<MacroRegime>>>,
 }
 
 impl ContextBuilder {
@@ -24,15 +26,19 @@ impl ContextBuilder {
         price_series: Arc<RwLock<PriceSeries>>,
         pool_price: Arc<RwLock<f64>>,
         pool_liquidity: Arc<RwLock<f64>>,
+        tick_liquidity: Arc<RwLock<TickLiquidity>>,
         pending_txs: Arc<RwLock<VecDeque<PendingTx>>>,
         block_number: Arc<RwLock<u64>>,
+        macro_regime: Arc<RwLock<Option<MacroRegime>>>,
     ) -> Self {
         Self {
             price_series,
             pool_price,
             pool_liquidity,
+            tick_liquidity,
             pending_txs,
             block_number,
+            macro_regime,
         }
     }
 
@@ -68,7 +74,8 @@ impl ContextBuilder {
             }
         };
 
-        let orderbook = orderbook::build_orderbook(0, pool_liquidity, current_price);
+        let tick_liquidity = self.tick_liquidity.read().await.clone();
+        let orderbook = orderbook::build_orderbook(tick_liquidity.current_tick, pool_liquidity, current_price);
 
         let recent_whale_txs = {
             let txs = self.pending_txs.read().await;
@@ -77,17 +84,21 @@ impl ContextBuilder {
 
         let block_number = *self.block_number.read().await;
 
+        let macro_regime = self.macro_regime.read().await.clone();
+
         Ok(MarketContext {
             pair: pair.to_string(),
             pool_address,
             prices,
             volumes,
             orderbook,
+            tick_liquidity: Some(tick_liquidity),
             recent_whale_txs,
             pool_liquidity,
             current_price,
             block_number,
             timestamp: Instant::now(),
+            macro_regime,
         })
     }
 }
@@ -104,7 +115,7 @@ fn estimate_whale_txs(txs: &VecDeque<PendingTx>, _price: f64) -> Vec<WhaleTx> {
                 hash: tx.hash,
                 from: tx.from,
                 usd_value: usd_val,
-                is_buy: tx.to.map(|t| t == USDC_ADDRESS).unwrap_or(false),
+                is_buy: matches!(tx.direction, Some(Vote::Buy)),
                 block: tx.block_number.unwrap_or(0),
             }
         })

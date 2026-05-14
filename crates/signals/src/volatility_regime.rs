@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use async_trait::async_trait;
 use vertexa_core::{Signal, SignalResult, Vote, MarketContext};
 
@@ -10,19 +11,23 @@ pub enum Regime {
 
 pub struct VolatilityRegimeSignal {
     pub atr_period: usize,
+    pub history: std::sync::Mutex<VecDeque<f64>>,
 }
 
 impl VolatilityRegimeSignal {
     pub fn new() -> Self {
-        Self { atr_period: 14 }
+        Self {
+            atr_period: 14,
+            history: std::sync::Mutex::new(VecDeque::with_capacity(200)),
+        }
     }
 
-    pub fn classify(prices: &[f64], atr_period: usize) -> Option<Regime> {
-        if prices.len() < atr_period + 1 {
+    pub fn classify(&self, prices: &[f64]) -> Option<Regime> {
+        if prices.len() < self.atr_period + 1 {
             return None;
         }
 
-        let start_idx = prices.len() - atr_period;
+        let start_idx = prices.len() - self.atr_period;
         let mut total_tr = 0.0;
 
         for i in start_idx..prices.len() {
@@ -30,13 +35,36 @@ impl VolatilityRegimeSignal {
             total_tr += tr;
         }
 
-        let atr = total_tr / atr_period as f64;
+        let atr = total_tr / self.atr_period as f64;
         let current_price = prices[prices.len() - 1];
         let atr_pct = atr / current_price;
 
-        let regime = if atr_pct < 0.008 {
+        let mut history = self.history.lock().unwrap();
+        if history.len() >= 100 {
+            history.pop_front();
+        }
+        history.push_back(atr_pct);
+
+        if history.len() < 50 {
+            // Not enough history for adaptive thresholds, use defaults
+            return Some(if atr_pct < 0.008 {
+                Regime::Ranging
+            } else if atr_pct <= 0.025 {
+                Regime::Trending
+            } else {
+                Regime::Volatile
+            });
+        }
+
+        let mut sorted = history.iter().copied().collect::<Vec<f64>>();
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let p25 = sorted[sorted.len() / 4];
+        let p75 = sorted[3 * sorted.len() / 4];
+
+        let regime = if atr_pct < p25 {
             Regime::Ranging
-        } else if atr_pct <= 0.025 {
+        } else if atr_pct <= p75 {
             Regime::Trending
         } else {
             Regime::Volatile
@@ -59,7 +87,7 @@ impl Signal for VolatilityRegimeSignal {
     }
 
     async fn evaluate(&self, ctx: &MarketContext) -> SignalResult {
-        match Self::classify(&ctx.prices, self.atr_period) {
+        match self.classify(&ctx.prices) {
             Some(regime) => match regime {
                 Regime::Ranging => SignalResult::new(self.name(), Vote::Neutral, 0.0),
                 Regime::Trending => SignalResult::new(self.name(), Vote::Neutral, 1.0),

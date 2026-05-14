@@ -43,6 +43,10 @@ impl TxSigner {
         &self.signer
     }
 
+    pub fn clone_signer(&self) -> PrivateKeySigner {
+        self.signer.clone()
+    }
+
     pub async fn sign_tx(
         &self,
         tx: &TransactionRequest,

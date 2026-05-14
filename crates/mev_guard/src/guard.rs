@@ -140,6 +140,7 @@ mod tests {
             value: U256::ZERO,
             input: vec![],
             block_number: None,
+            direction: None,
         });
         let mut bots = HashSet::new();
         bots.insert(bot);

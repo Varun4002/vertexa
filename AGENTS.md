@@ -30,9 +30,10 @@ bin/               Binary entrypoints (vertexa.rs, backtester.rs)
 - `Decision` — includes `size_multiplier: f64` (1.0/0.5/0.0) and `blocked_by: Option<&'static str>`
 - `CostBreakdown` — gas + slippage + MEV cost analysis
 - `TradeIntent` — Sent to ExecutorActor via mpsc (token, amount, direction, min output)
-- `ExecutionResult` — Returned from ExecutorActor via oneshot (success/failure, tx hash, gas used)
+- `ExecutionResult` — Returned from ExecutorActor via oneshot (success/failure, tx hash, gas used, actual_amount_out)
 - `VertexaError::TradeNotProfitable { reward_to_cost, minimum }`
 - `TradeNotification` — Discord-ready notification struct with action, amount, route, risk, tx hash
+- `actual_amount_out` — Used for post-execution slippage kill-switch (detects deviation from expected_min)
 
 ## Key Conventions
 
@@ -50,6 +51,7 @@ bin/               Binary entrypoints (vertexa.rs, backtester.rs)
 - **Money arithmetic:** Use `FixedUsd`, not raw `f64` for financial values
 - **Notifications:** Discord webhook via `vertexa-notify` crate (optional — configured in `[notify]` config section)
 - **Persistence:** State saved to `vertexa_state.json` on graceful shutdown, restored on startup
+- **Safety Gates:** Includes Minimum Trade Size Gate ($20 floor) and Staleness Protection re-sync
 
 ## Signals
 
@@ -71,11 +73,15 @@ bin/               Binary entrypoints (vertexa.rs, backtester.rs)
    ├── p25 ≤ atr_pct ≤ p75 → Trending → size_multiplier = 1.0
    └── atr_pct > p75 → Volatile → size_multiplier = 0.5
 
-2. Run all signals, collect votes
+2. MINIMUM TRADE SIZE GATE
+   ├── adjusted_usd = max_trade_usd * size_multiplier
+   └── if adjusted_usd < config.min_trade_usd → BLOCK TRADE
 
-3. Majority vote logic
+3. Run all signals, collect votes
 
-4. Confidence gate (min_confidence threshold)
+4. Majority vote logic
+
+5. Confidence gate (min_confidence threshold)
 ```
 
 ## Profitability Gate Algorithm
@@ -122,7 +128,7 @@ Events: Swap(..., sqrtPriceX96, liquidity, tick), Mint(...), Burn(...)
 1. Subscribe to pool address, filter by Swap/Mint/Burn topics
 2. Swap: update price, current liquidity, and current tick
 3. Mint/Burn: update local TickLiquidity BTreeMap (liquidity_net per tick)
-4. Local reconstruction enables high-fidelity depth analysis
+4. Staleness Protection: Divergence > 0.1% between WS and RPC triggers re-sync from latest - 10 blocks
 ```
 
 ## Mempool Whale Decoder

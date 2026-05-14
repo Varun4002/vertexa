@@ -4,7 +4,7 @@ use chrono::{Utc, DateTime};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
-use vertexa_core::{PlannedTrade, MevThreatAssessment, ExecutionRoute, VertexaError, FixedUsd};
+use vertexa_core::{PlannedTrade, MevThreatAssessment, ExecutionRoute, VertexaError, FixedUsd, MacroRegime, ExecutionResult};
 use crate::profitability::{ProfitabilityCheck, CostBreakdown};
 
 pub struct RiskChecker {
@@ -77,12 +77,15 @@ impl RiskChecker {
         trade: &PlannedTrade,
         avg_confidence: f64,
         estimated_mev_loss: FixedUsd,
+        gas_cost: FixedUsd,
+        sim_confidence: Option<vertexa_core::SimulationConfidence>,
     ) -> Result<CostBreakdown, VertexaError> {
         let breakdown = self.profitability.evaluate(
             trade,
             avg_confidence,
             estimated_mev_loss,
-            FixedUsd::from_dollars(0.10),
+            gas_cost,
+            sim_confidence,
         );
 
         info!(
@@ -111,9 +114,23 @@ impl RiskChecker {
         &self,
         trade: &PlannedTrade,
         assessment: &MevThreatAssessment,
+        macro_regime: Option<&MacroRegime>,
     ) -> Result<(), String> {
         if self.circuit_breaker_active.load(Ordering::SeqCst) == 1 {
             return Err("circuit breaker active — trading halted".into());
+        }
+
+        let mut max_trade_limit = self.max_trade_usd;
+        let mut max_position_limit = self.max_position_usd;
+
+        if let Some(macro_r) = macro_regime {
+            if macro_r.match_score > 0.8 {
+                if let Some(scale) = macro_r.size_multiplier_override {
+                    max_trade_limit *= scale;
+                    max_position_limit *= scale;
+                    info!(target: "vertexa", scale, "scaling risk limits based on macro regime");
+                }
+            }
         }
 
         let max_safe_slippage = match assessment.recommended_route {
@@ -130,22 +147,52 @@ impl RiskChecker {
             ));
         }
 
-        if trade.amount_usd > self.max_trade_usd {
+        if trade.amount_usd > max_trade_limit {
             return Err(format!(
                 "trade ${:.2} exceeds max trade ${:.2}",
-                trade.amount_usd, self.max_trade_usd
+                trade.amount_usd, max_trade_limit
             ));
         }
 
         let current_pos = self.current_position.load(Ordering::SeqCst) as f64 / 100.0;
         let new_pos = current_pos + trade.amount_usd;
-        if new_pos > self.max_position_usd {
+        if new_pos > max_position_limit {
             return Err(format!(
                 "position ${:.2} would exceed max position ${:.2}",
-                new_pos, self.max_position_usd
+                new_pos, max_position_limit
             ));
         }
 
+        Ok(())
+    }
+
+    pub fn check_slippage(
+        &self,
+        trade: &PlannedTrade,
+        result: &ExecutionResult,
+    ) -> Result<(), String> {
+        if !result.success {
+            return Ok(());
+        }
+
+        let actual = match result.actual_amount_out {
+            Some(a) => a,
+            None => {
+                warn!(target: "vertexa", "ExecutionResult missing actual_amount_out, skipping slippage check");
+                return Ok(());
+            }
+        };
+
+        if actual < trade.expected_min_amount_out {
+            self.circuit_breaker_active.store(1, Ordering::SeqCst);
+            let err = format!(
+                "EXCESSIVE SLIPPAGE: Actual {:?} < Expected {:?}",
+                actual, trade.expected_min_amount_out
+            );
+            warn!(target: "vertexa", error = %err, "CIRCUIT BREAKER TRIGGERED");
+            return Err(err);
+        }
+        
         Ok(())
     }
 
@@ -241,7 +288,7 @@ mod tests {
         let checker = RiskChecker::new(&config);
         let trade = make_trade(5000.0, 0.005);
         let assessment = make_assessment(ExecutionRoute::PublicMempool);
-        assert!(checker.check(&trade, &assessment).is_ok());
+        assert!(checker.check(&trade, &assessment, None).is_ok());
     }
 
     #[test]
@@ -254,7 +301,7 @@ mod tests {
         let checker = RiskChecker::new(&config);
         let trade = make_trade(20_000.0, 0.005);
         let assessment = make_assessment(ExecutionRoute::PublicMempool);
-        assert!(checker.check(&trade, &assessment).is_err());
+        assert!(checker.check(&trade, &assessment, None).is_err());
     }
 
     #[test]
@@ -268,6 +315,6 @@ mod tests {
         checker.circuit_breaker_active.store(1, std::sync::atomic::Ordering::SeqCst);
         let trade = make_trade(1000.0, 0.005);
         let assessment = make_assessment(ExecutionRoute::PublicMempool);
-        assert!(checker.check(&trade, &assessment).is_err());
+        assert!(checker.check(&trade, &assessment, None).is_err());
     }
 }

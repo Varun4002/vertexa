@@ -1,4 +1,6 @@
 use alloy::primitives::{Address, B256, U256, address};
+use alloy::rpc::types::TransactionRequest;
+use tokio::sync::oneshot;
 use crate::Vote;
 use std::time::Instant;
 use std::fmt;
@@ -36,6 +38,29 @@ impl std::ops::Sub for FixedUsd {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MacroRegime {
+    pub name: String,
+    pub description: String,
+    pub match_score: f64,
+    pub size_multiplier_override: Option<f64>,
+    pub confidence_modifier: f64,
+    pub historical_period: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TickData {
+    pub liquidity_net: i128,
+    pub liquidity_gross: u128,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TickLiquidity {
+    pub ticks: std::collections::BTreeMap<i32, TickData>,
+    pub current_tick: i32,
+    pub current_liquidity: u128,
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketContext {
     pub pair: String,
@@ -43,11 +68,13 @@ pub struct MarketContext {
     pub prices: Vec<f64>,
     pub volumes: Vec<f64>,
     pub orderbook: OrderBook,
+    pub tick_liquidity: Option<TickLiquidity>,
     pub recent_whale_txs: Vec<WhaleTx>,
     pub pool_liquidity: f64,
     pub current_price: f64,
     pub block_number: u64,
     pub timestamp: Instant,
+    pub macro_regime: Option<MacroRegime>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +104,7 @@ pub struct PlannedTrade {
     pub token_in: Address,
     pub token_out: Address,
     pub amount_in: U256,
+    pub expected_min_amount_out: U256,
     pub amount_usd: f64,
     pub max_slippage: f64,
     pub pool_fee: u32,
@@ -90,6 +118,31 @@ pub struct PendingTx {
     pub value: U256,
     pub input: Vec<u8>,
     pub block_number: Option<u64>,
+    pub direction: Option<Vote>,
+}
+
+pub type TradeIntent = (PlannedTrade, TransactionRequest, oneshot::Sender<ExecutionResult>, Option<u128>); // (trade, tx, resp, max_gas_price)
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SimulationConfidence {
+    High,
+    Low,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulationResult {
+    pub amount_out: U256,
+    pub gas_used: u64,
+    pub confidence: SimulationConfidence,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionResult {
+    pub success: bool,
+    pub tx_hash: Option<B256>,
+    pub gas_used: Option<u64>,
+    pub actual_amount_out: Option<U256>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]

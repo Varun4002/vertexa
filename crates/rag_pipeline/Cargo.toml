@@ -1,0 +1,15 @@
+[package]
+name = "vertexa-rag"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vertexa-core = { path = "../core" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+qdrant-client = "1.10"

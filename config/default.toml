@@ -8,6 +8,7 @@ pair = "ETH/USDC"
 pool_address = "0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443"
 pool_fee_tier = 500
 max_trade_usd = 10000.0
+min_trade_usd = 20.0
 max_position_usd = 50000.0
 loop_interval_s = 15
 
@@ -29,3 +30,8 @@ mempool_buffer_size = 500
 [consensus]
 required_votes = 3
 min_confidence = 0.35
+
+[reputation]
+# Smart money / High reputation swappers
+"0x00000000003b3cc22aF3aE1EAc0440BcEe416B40" = 2.0
+"0x000000000035B5e5ad9019092C665357240f594e" = 1.5

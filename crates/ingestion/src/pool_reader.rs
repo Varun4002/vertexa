@@ -47,6 +47,7 @@ pub async fn start(
     pool_liquidity: Arc<RwLock<f64>>,
     block_number: Arc<RwLock<u64>>,
     rpc_url: &str,
+    reset_signal: Arc<tokio::sync::Notify>,
 ) {
     let pool_addr = match POOL_ADDR.parse::<alloy::primitives::Address>() {
         Ok(a) => a,
@@ -75,6 +76,25 @@ pub async fn start(
             match pool.slot0().call().await {
                 Ok(result) => {
                     let price = sqrt_price_to_usd(U256::from(result.sqrtPriceX96));
+                    
+                    // Staleness Protection: Compare with local price
+                    {
+                        let local_price = *current_price.read().await;
+                        if local_price > 0.0 {
+                            let divergence = (price - local_price).abs() / local_price;
+                            if divergence > 0.001 { // 0.1% threshold
+                                warn!(
+                                    target: "vertexa",
+                                    price_rpc = price,
+                                    price_local = local_price,
+                                    divergence = divergence,
+                                    "Staleness detected! Price divergence exceeds 0.1%. Triggering re-sync."
+                                );
+                                reset_signal.notify_one();
+                            }
+                        }
+                    }
+
                     let mut price_val = current_price.write().await;
                     *price_val = price;
 

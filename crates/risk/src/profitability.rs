@@ -26,6 +26,7 @@ impl ProfitabilityCheck {
         avg_confidence: f64,
         estimated_mev_loss: FixedUsd,
         gas_estimate_usd: FixedUsd,
+        sim_confidence: Option<vertexa_core::SimulationConfidence>,
     ) -> CostBreakdown {
         let edge_pct = 0.005 + (avg_confidence * 0.01);
         let expected_edge_usd = FixedUsd::from_dollars(
@@ -48,7 +49,13 @@ impl ProfitabilityCheck {
             expected_edge_usd.to_dollars() / total_cost_usd.to_dollars()
         };
 
-        let is_profitable = reward_to_cost >= self.min_reward_to_cost;
+        let min_ratio = if sim_confidence == Some(vertexa_core::SimulationConfidence::Low) {
+            self.min_reward_to_cost + 0.5
+        } else {
+            self.min_reward_to_cost
+        };
+
+        let is_profitable = reward_to_cost >= min_ratio;
 
         CostBreakdown {
             gas_cost_usd: gas_estimate_usd,
